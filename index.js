@@ -13,7 +13,7 @@ const DEFAULT_CORS_ALLOWED = [
   "http://localhost:3000",
 ];
 
-const CORS_ALLOWED_LIST: string[] = (() => {
+const CORS_ALLOWED_LIST = (() => {
   const raw = process.env.CORS_ALLOWED_ORIGIN;
   if (!raw) return DEFAULT_CORS_ALLOWED;
   const parsed = raw
@@ -27,7 +27,7 @@ const CORS_ALLOWED_LIST: string[] = (() => {
   return merged;
 })();
 
-function isAllowedOrigin(origin: string | undefined): boolean {
+function isAllowedOrigin(origin) {
   if (!origin) return true;
   const normalized = origin.replace(/\/$/, "");
   return CORS_ALLOWED_LIST.some(
@@ -554,25 +554,19 @@ app.post(
       if (answers.length > 0) {
         const rows = answers
           .filter(
-            (
-              a,
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            ): a is any =>
+            (a) =>
               a && typeof a === "object" && typeof a.question_id === "string",
           )
-          .map(
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (a: any) => ({
-              id: `aa_${attemptId}_${a.question_id}`,
-              attempt_id: attemptId,
-              question_id: a.question_id,
-              answer_given:
-                typeof a.given === "string" ? a.given : JSON.stringify(a.given ?? null),
-              correct_answer:
-                typeof a.correct === "string" ? a.correct : JSON.stringify(a.correct ?? ""),
-              is_correct: !!a.is_correct,
-            }),
-          );
+          .map((a) => ({
+            id: `aa_${attemptId}_${a.question_id}`,
+            attempt_id: attemptId,
+            question_id: a.question_id,
+            answer_given:
+              typeof a.given === "string" ? a.given : JSON.stringify(a.given ?? null),
+            correct_answer:
+              typeof a.correct === "string" ? a.correct : JSON.stringify(a.correct ?? ""),
+            is_correct: !!a.is_correct,
+          }));
 
         const { error: insertErr } = await supabase
           .from("attempt_answers")
