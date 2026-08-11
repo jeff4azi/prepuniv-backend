@@ -561,6 +561,8 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
           id: `aa_${attemptId}_${a.question_id}`,
           attempt_id: attemptId,
           question_id: a.question_id,
+          question_text:
+            typeof a.question_text === "string" ? a.question_text : null,
           answer_given:
             typeof a.given === "string"
               ? a.given
