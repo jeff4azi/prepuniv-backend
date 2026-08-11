@@ -352,7 +352,9 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
 
     const userBalance = balanceRow?.balance || 0;
 
-    if (userBalance < quiz.price) {
+    const priceNaira = Number(quiz.price) / 100;
+
+    if (userBalance < priceNaira) {
       return res.status(402).json({ error: "Insufficient balance" });
     }
 
@@ -363,7 +365,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       .insert({
         id: "wtx_" + crypto.randomUUID(),
         user_id: req.user.id,
-        amount: -quiz.price,
+        amount: -priceNaira,
         type: "quiz_payment",
         status: "completed",
         reference: payRef,
