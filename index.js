@@ -103,6 +103,7 @@ app.post(
       const { error: txError } = await supabase
         .from("wallet_transactions")
         .insert({
+          id: "wtx_" + crypto.randomUUID(),
           user_id: req.user.id,
           amount,
           type: "topup",
@@ -111,6 +112,7 @@ app.post(
         });
 
       if (txError) {
+        console.error("wallet_transactions insert error:", txError);
         return res
           .status(500)
           .json({ error: "Failed to create transaction record" });
@@ -343,6 +345,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
     const { error: payErr } = await supabase
       .from("wallet_transactions")
       .insert({
+        id: "wtx_" + crypto.randomUUID(),
         user_id: req.user.id,
         amount: -quiz.price,
         type: "quiz_payment",
@@ -358,6 +361,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
     const { data: attempt, error: attemptErr } = await supabase
       .from("quiz_attempts")
       .insert({
+        id: "att_" + crypto.randomUUID(),
         user_id: req.user.id,
         quiz_id: quiz.id,
         is_timed: !!is_timed,
@@ -539,6 +543,7 @@ app.post(
       if (!bank_code || !account_number) {
         const failNote = "Missing bank details for creator";
         await supabase.from("wallet_transactions").insert({
+          id: "wtx_" + crypto.randomUUID(),
           user_id: creator.id,
           amount: 0,
           type: "payout",
@@ -601,6 +606,7 @@ app.post(
 
       if (transferSuccess) {
         await supabase.from("wallet_transactions").insert({
+          id: "wtx_" + crypto.randomUUID(),
           user_id: creator.id,
           amount: -payoutRequest.amount,
           type: "payout",
@@ -621,6 +627,7 @@ app.post(
         });
       } else {
         await supabase.from("wallet_transactions").insert({
+          id: "wtx_" + crypto.randomUUID(),
           user_id: creator.id,
           amount: 0,
           type: "payout",
