@@ -8,7 +8,7 @@ import axios from "axios";
 dotenv.config();
 
 const CORS_ALLOWED_ORIGIN =
-  process.env.CORS_ALLOWED_ORIGIN || "http://localhost:5173";
+  process.env.CORS_ALLOWED_ORIGIN || "https://prepuniv.vercel.app";
 const FLUTTERWAVE_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || "";
 const FLUTTERWAVE_WEBHOOK_SECRET = process.env.FLUTTERWAVE_WEBHOOK_SECRET || "";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
