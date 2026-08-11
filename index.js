@@ -7,34 +7,8 @@ import axios from "axios";
 
 dotenv.config();
 
-const DEFAULT_CORS_ALLOWED = [
-  "https://prepuniv.vercel.app",
-  "http://localhost:5173",
-  "http://localhost:3000",
-];
-
-const CORS_ALLOWED_LIST = (() => {
-  const raw = process.env.CORS_ALLOWED_ORIGIN;
-  if (!raw) return DEFAULT_CORS_ALLOWED;
-  const parsed = raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  const merged = [...parsed];
-  for (const o of DEFAULT_CORS_ALLOWED) {
-    if (!merged.includes(o)) merged.push(o);
-  }
-  return merged;
-})();
-
-function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  const normalized = origin.replace(/\/$/, "");
-  return CORS_ALLOWED_LIST.some(
-    (o) => o.replace(/\/$/, "") === normalized,
-  );
-}
-
+const CORS_ALLOWED_ORIGIN =
+  process.env.CORS_ALLOWED_ORIGIN || "https://prepuniv.vercel.app";
 const FLUTTERWAVE_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || "";
 const FLUTTERWAVE_WEBHOOK_SECRET = process.env.FLUTTERWAVE_WEBHOOK_SECRET || "";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -45,49 +19,10 @@ const MINIMUM_PAYOUT_THRESHOLD = 2000;
 
 const app = express();
 
-// Explicit preflight handler (before cors) to always respond on OPTIONS.
-// Vercel serverless sometimes drops cors middleware preflights on cold starts.
-app.options("*", (req, res) => {
-  const origin = req.headers.origin;
-  const resolved = isAllowedOrigin(origin) ? (origin ?? "*") : CORS_ALLOWED_LIST[0];
-  res.setHeader("Access-Control-Allow-Origin", resolved);
-  res.setHeader(
-    "Access-Control-Allow-Methods",
-    "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
-  );
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type,Authorization,Accept,Origin,X-Requested-With",
-  );
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader("Access-Control-Max-Age", "86400");
-  return res.sendStatus(204);
-});
-
-// Safety net: always reflect a valid Allow-Origin on responses.
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  const resolved = isAllowedOrigin(origin) ? (origin ?? "*") : CORS_ALLOWED_LIST[0];
-  if (!res.getHeader("Access-Control-Allow-Origin")) {
-    res.setHeader("Access-Control-Allow-Origin", resolved);
-    res.setHeader("Access-Control-Allow-Credentials", "true");
-  }
-  next();
-});
-
 app.use(
   cors({
-    origin: (origin, cb) => {
-      if (isAllowedOrigin(origin)) {
-        cb(null, origin ?? true);
-      } else {
-        // eslint-disable-next-line no-console
-        console.warn("[CORS] blocked origin:", origin, "allowed:", CORS_ALLOWED_LIST);
-        cb(null, CORS_ALLOWED_LIST[0]);
-      }
-    },
+    origin: CORS_ALLOWED_ORIGIN,
     credentials: true,
-    optionsSuccessStatus: 200,
   }),
 );
 
@@ -196,7 +131,7 @@ app.post(
           tx_ref,
           amount,
           currency: "NGN",
-          redirect_url: `${CORS_ALLOWED_LIST[0]}/wallet?tx_ref=${tx_ref}`,
+          redirect_url: `${CORS_ALLOWED_ORIGIN}/wallet?tx_ref=${tx_ref}`,
           customer: {
             email: req.user.email,
           },
@@ -208,7 +143,7 @@ app.post(
         payment_link = response.data?.data?.link;
       } catch (fwErr) {
         console.error("Flutterwave payment init failed:", fwErr.message);
-        payment_link = `${CORS_ALLOWED_LIST[0]}/wallet?tx_ref=${tx_ref}&mock_payment=1`;
+        payment_link = `${CORS_ALLOWED_ORIGIN}/wallet?tx_ref=${tx_ref}&mock_payment=1`;
       }
 
       return res.json({ payment_link, tx_ref });
@@ -554,19 +489,25 @@ app.post(
       if (answers.length > 0) {
         const rows = answers
           .filter(
-            (a) =>
+            (
+              a,
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            ): a is any =>
               a && typeof a === "object" && typeof a.question_id === "string",
           )
-          .map((a) => ({
-            id: `aa_${attemptId}_${a.question_id}`,
-            attempt_id: attemptId,
-            question_id: a.question_id,
-            answer_given:
-              typeof a.given === "string" ? a.given : JSON.stringify(a.given ?? null),
-            correct_answer:
-              typeof a.correct === "string" ? a.correct : JSON.stringify(a.correct ?? ""),
-            is_correct: !!a.is_correct,
-          }));
+          .map(
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            (a: any) => ({
+              id: `aa_${attemptId}_${a.question_id}`,
+              attempt_id: attemptId,
+              question_id: a.question_id,
+              answer_given:
+                typeof a.given === "string" ? a.given : JSON.stringify(a.given ?? null),
+              correct_answer:
+                typeof a.correct === "string" ? a.correct : JSON.stringify(a.correct ?? ""),
+              is_correct: !!a.is_correct,
+            }),
+          );
 
         const { error: insertErr } = await supabase
           .from("attempt_answers")
