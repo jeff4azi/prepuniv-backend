@@ -592,9 +592,11 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
 
     // 4. Bump attempt_count on the quiz itself (best-effort, ignore errors)
     if (existing.quiz_id) {
-      supabase
-        .rpc("increment_attempt_count", { quiz_id_in: existing.quiz_id })
-        .catch(() => void 0);
+      Promise.resolve(
+        supabase.rpc("increment_attempt_count", {
+          quiz_id_in: existing.quiz_id,
+        }),
+      ).catch(() => void 0);
     }
 
     return res.json({ ok: true });
