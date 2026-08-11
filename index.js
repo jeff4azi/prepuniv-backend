@@ -350,48 +350,66 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       .eq("user_id", req.user.id)
       .maybeSingle();
 
-    const userBalance = balanceRow?.balance || 0;
+    if (balanceErr) {
+      console.error("Balance lookup error:", balanceErr);
+      return res.status(500).json({ error: "Failed to look up balance" });
+    }
+
+    const userBalance = Number(balanceRow?.balance || 0);
 
     const priceNaira = Number(quiz.price) / 100;
 
     if (userBalance < priceNaira) {
-      return res.status(402).json({ error: "Insufficient balance" });
+      return res.status(402).json({
+        error: `Insufficient balance: need ₦${priceNaira.toFixed(2)}, have ₦${userBalance.toFixed(2)}`,
+      });
     }
 
+    const attemptId = "att_" + crypto.randomUUID();
     const payRef = "quizpay_" + crypto.randomUUID();
+    const paymentTxnId = "wtx_" + crypto.randomUUID();
 
     const { error: payErr } = await supabase
       .from("wallet_transactions")
       .insert({
-        id: "wtx_" + crypto.randomUUID(),
+        id: paymentTxnId,
         user_id: req.user.id,
         amount: -priceNaira,
         type: "quiz_payment",
         status: "completed",
         reference: payRef,
         related_quiz_id: quiz.id,
+        related_attempt_id: attemptId,
       });
 
     if (payErr) {
-      return res.status(500).json({ error: "Failed to process payment" });
+      console.error("Wallet txn insert error:", payErr);
+      return res.status(500).json({
+        error: "Failed to process payment",
+        detail: payErr.message,
+      });
     }
 
     const { data: attempt, error: attemptErr } = await supabase
       .from("quiz_attempts")
       .insert({
-        id: "att_" + crypto.randomUUID(),
+        id: attemptId,
         user_id: req.user.id,
         quiz_id: quiz.id,
         is_timed: !!is_timed,
         time_allowed_seconds: is_timed
-          ? time_allowed_seconds || quiz.time_allowed_seconds
+          ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) || null
           : null,
       })
       .select()
       .single();
 
     if (attemptErr || !attempt) {
-      return res.status(500).json({ error: "Failed to create quiz attempt" });
+      console.error("Quiz attempt insert error:", attemptErr);
+      return res.status(500).json({
+        error: "Failed to create quiz attempt",
+        detail: attemptErr?.message,
+      });
     }
 
     return res.json({
@@ -401,7 +419,10 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
     });
   } catch (err) {
     console.error("Quiz attempt error:", err);
-    return res.status(500).json({ error: "Internal server error" });
+    return res.status(500).json({
+      error: "Internal server error",
+      detail: err instanceof Error ? err.message : String(err),
+    });
   }
 });
 
