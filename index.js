@@ -45,6 +45,36 @@ const MINIMUM_PAYOUT_THRESHOLD = 2000;
 
 const app = express();
 
+// Explicit preflight handler (before cors) to always respond on OPTIONS.
+// Vercel serverless sometimes drops cors middleware preflights on cold starts.
+app.options("*", (req, res) => {
+  const origin = req.headers.origin;
+  const resolved = isAllowedOrigin(origin) ? (origin ?? "*") : CORS_ALLOWED_LIST[0];
+  res.setHeader("Access-Control-Allow-Origin", resolved);
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
+  );
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type,Authorization,Accept,Origin,X-Requested-With",
+  );
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Max-Age", "86400");
+  return res.sendStatus(204);
+});
+
+// Safety net: always reflect a valid Allow-Origin on responses.
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const resolved = isAllowedOrigin(origin) ? (origin ?? "*") : CORS_ALLOWED_LIST[0];
+  if (!res.getHeader("Access-Control-Allow-Origin")) {
+    res.setHeader("Access-Control-Allow-Origin", resolved);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+  next();
+});
+
 app.use(
   cors({
     origin: (origin, cb) => {
