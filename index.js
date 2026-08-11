@@ -29,16 +29,23 @@ app.use(
 );
 
 // Explicitly handle preflight OPTIONS requests for all routes.
-// Vercel serverless can strip preflight responses unless this is present.
-app.options(
-  "*",
-  cors({
-    origin: CORS_ALLOWED_ORIGIN,
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  }),
-);
+// Explicitly handle preflight OPTIONS requests for all routes.
+// Express 5 + path-to-regexp v8 dropped wildcard string support,
+// so we use a middleware instead of app.options() with a wildcard path.
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", CORS_ALLOWED_ORIGIN);
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    );
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+    res.setHeader("Access-Control-Max-Age", "86400");
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.use(
   express.json({
