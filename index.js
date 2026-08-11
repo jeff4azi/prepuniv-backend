@@ -809,8 +809,12 @@ app.get("/api/banks", authenticateRequest, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// app.listen is only used in local development.
+// On Vercel (serverless), the exported app is used directly as the handler.
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
 
 export default app;
