@@ -366,79 +366,129 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       return res.status(404).json({ error: "Quiz not found" });
     }
 
-    const { data: balanceRow, error: balanceErr } = await supabase
-      .from("user_balances")
-      .select("*")
+    // Check if the user has already paid for this quiz (prior completed quiz_payment txn)
+    const { data: priorPayment } = await supabase
+      .from("wallet_transactions")
+      .select("id")
       .eq("user_id", req.user.id)
+      .eq("type", "quiz_payment")
+      .eq("status", "completed")
+      .eq("related_quiz_id", quiz_id)
+      .limit(1)
       .maybeSingle();
 
-    if (balanceErr) {
-      console.error("Balance lookup error:", balanceErr);
-      return res.status(500).json({ error: "Failed to look up balance" });
-    }
+    const alreadyPaid = !!priorPayment;
 
-    const userBalance = Number(balanceRow?.balance || 0);
+    if (!alreadyPaid) {
+      // First-time purchase — check balance and debit wallet
+      const { data: balanceRow, error: balanceErr } = await supabase
+        .from("user_balances")
+        .select("*")
+        .eq("user_id", req.user.id)
+        .maybeSingle();
 
-    const priceNaira = Number(quiz.price) / 100;
+      if (balanceErr) {
+        console.error("Balance lookup error:", balanceErr);
+        return res.status(500).json({ error: "Failed to look up balance" });
+      }
 
-    if (userBalance < priceNaira) {
-      return res.status(402).json({
-        error: `Insufficient balance: need ₦${priceNaira.toFixed(2)}, have ₦${userBalance.toFixed(2)}`,
+      const userBalance = Number(balanceRow?.balance || 0);
+      const priceNaira = Number(quiz.price) / 100;
+
+      if (userBalance < priceNaira) {
+        return res.status(402).json({
+          error: `Insufficient balance: need ₦${priceNaira.toFixed(2)}, have ₦${userBalance.toFixed(2)}`,
+        });
+      }
+
+      const attemptId = "att_" + crypto.randomUUID();
+      const payRef = "quizpay_" + crypto.randomUUID();
+      const paymentTxnId = "wtx_" + crypto.randomUUID();
+
+      const { error: payErr } = await supabase
+        .from("wallet_transactions")
+        .insert({
+          id: paymentTxnId,
+          user_id: req.user.id,
+          amount: -priceNaira,
+          type: "quiz_payment",
+          status: "completed",
+          reference: payRef,
+          related_quiz_id: quiz.id,
+          related_attempt_id: attemptId,
+        });
+
+      if (payErr) {
+        console.error("Wallet txn insert error:", payErr);
+        return res.status(500).json({
+          error: "Failed to process payment",
+          detail: payErr.message,
+        });
+      }
+
+      const { data: attempt, error: attemptErr } = await supabase
+        .from("quiz_attempts")
+        .insert({
+          id: attemptId,
+          user_id: req.user.id,
+          quiz_id: quiz.id,
+          is_timed: !!is_timed,
+          time_allowed_seconds: is_timed
+            ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) ||
+              null
+            : null,
+        })
+        .select()
+        .single();
+
+      if (attemptErr || !attempt) {
+        console.error("Quiz attempt insert error:", attemptErr);
+        return res.status(500).json({
+          error: "Failed to create quiz attempt",
+          detail: attemptErr?.message,
+        });
+      }
+
+      return res.json({
+        attempt_id: attempt.id,
+        quiz_id: attempt.quiz_id,
+        quiz_snapshot: attempt.quiz_snapshot || null,
+        ...attempt,
+      });
+    } else {
+      // Retake — already paid, just create a new attempt row (no charge)
+      const attemptId = "att_" + crypto.randomUUID();
+
+      const { data: attempt, error: attemptErr } = await supabase
+        .from("quiz_attempts")
+        .insert({
+          id: attemptId,
+          user_id: req.user.id,
+          quiz_id: quiz.id,
+          is_timed: !!is_timed,
+          time_allowed_seconds: is_timed
+            ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) ||
+              null
+            : null,
+        })
+        .select()
+        .single();
+
+      if (attemptErr || !attempt) {
+        console.error("Quiz attempt insert error (retake):", attemptErr);
+        return res.status(500).json({
+          error: "Failed to create quiz attempt",
+          detail: attemptErr?.message,
+        });
+      }
+
+      return res.json({
+        attempt_id: attempt.id,
+        quiz_id: attempt.quiz_id,
+        quiz_snapshot: attempt.quiz_snapshot || null,
+        ...attempt,
       });
     }
-
-    const attemptId = "att_" + crypto.randomUUID();
-    const payRef = "quizpay_" + crypto.randomUUID();
-    const paymentTxnId = "wtx_" + crypto.randomUUID();
-
-    const { error: payErr } = await supabase
-      .from("wallet_transactions")
-      .insert({
-        id: paymentTxnId,
-        user_id: req.user.id,
-        amount: -priceNaira,
-        type: "quiz_payment",
-        status: "completed",
-        reference: payRef,
-        related_quiz_id: quiz.id,
-        related_attempt_id: attemptId,
-      });
-
-    if (payErr) {
-      console.error("Wallet txn insert error:", payErr);
-      return res.status(500).json({
-        error: "Failed to process payment",
-        detail: payErr.message,
-      });
-    }
-
-    const { data: attempt, error: attemptErr } = await supabase
-      .from("quiz_attempts")
-      .insert({
-        id: attemptId,
-        user_id: req.user.id,
-        quiz_id: quiz.id,
-        is_timed: !!is_timed,
-        time_allowed_seconds: is_timed
-          ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) || null
-          : null,
-      })
-      .select()
-      .single();
-
-    if (attemptErr || !attempt) {
-      console.error("Quiz attempt insert error:", attemptErr);
-      return res.status(500).json({
-        error: "Failed to create quiz attempt",
-        detail: attemptErr?.message,
-      });
-    }
-
-    return res.json({
-      attempt_id: attempt.id,
-      quiz_snapshot: attempt.quiz_snapshot || null,
-      ...attempt,
-    });
   } catch (err) {
     console.error("Quiz attempt error:", err);
     return res.status(500).json({
