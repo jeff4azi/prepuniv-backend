@@ -30,12 +30,15 @@ app.use(
 
 // Explicitly handle preflight OPTIONS requests for all routes.
 // Vercel serverless can strip preflight responses unless this is present.
-app.options("*", cors({
-  origin: CORS_ALLOWED_ORIGIN,
-  credentials: true,
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}));
+app.options(
+  "*",
+  cors({
+    origin: CORS_ALLOWED_ORIGIN,
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  }),
+);
 
 app.use(
   express.json({
@@ -221,7 +224,8 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
             .from("wallet_transactions")
             .update({ status: "failed" })
             .eq("id", txRow.id);
-          if (updateErr) console.error("Webhook failed-update error:", updateErr);
+          if (updateErr)
+            console.error("Webhook failed-update error:", updateErr);
         }
       }
     } catch (verifyErr) {
@@ -438,116 +442,108 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
 });
 
 // ─── Complete a quiz attempt: set score, timestamps, save graded answers ──────
-app.post(
-  "/api/attempt/:id/complete",
-  authenticateRequest,
-  async (req, res) => {
-    try {
-      const { id: attemptId } = req.params;
-      const {
-        score,
-        started_at,
-        completed_at,
-        time_taken_seconds,
-        answers,
-      } = req.body;
+app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
+  try {
+    const { id: attemptId } = req.params;
+    const { score, started_at, completed_at, time_taken_seconds, answers } =
+      req.body;
 
-      if (
-        typeof score !== "number" ||
-        score < 0 ||
-        score > 100 ||
-        !Array.isArray(answers)
-      ) {
-        return res.status(400).json({ error: "Invalid payload" });
-      }
+    if (
+      typeof score !== "number" ||
+      score < 0 ||
+      score > 100 ||
+      !Array.isArray(answers)
+    ) {
+      return res.status(400).json({ error: "Invalid payload" });
+    }
 
-      // 1. Verify ownership
-      const { data: existing, error: lookupErr } = await supabase
-        .from("quiz_attempts")
-        .select("*")
-        .eq("id", attemptId)
-        .maybeSingle();
+    // 1. Verify ownership
+    const { data: existing, error: lookupErr } = await supabase
+      .from("quiz_attempts")
+      .select("*")
+      .eq("id", attemptId)
+      .maybeSingle();
 
-      if (lookupErr) throw lookupErr;
-      if (!existing) return res.status(404).json({ error: "Attempt not found" });
-      if (existing.user_id !== req.user.id) {
-        return res.status(403).json({ error: "Not your attempt" });
-      }
+    if (lookupErr) throw lookupErr;
+    if (!existing) return res.status(404).json({ error: "Attempt not found" });
+    if (existing.user_id !== req.user.id) {
+      return res.status(403).json({ error: "Not your attempt" });
+    }
 
-      // 2. Update the attempt row (score, timestamps, time taken)
-      const { error: updateErr } = await supabase
-        .from("quiz_attempts")
-        .update({
-          score: Number(score.toFixed(2)),
-          started_at: started_at ?? existing.started_at ?? new Date().toISOString(),
-          completed_at: completed_at ?? new Date().toISOString(),
-          time_taken_seconds:
-            typeof time_taken_seconds === "number" && time_taken_seconds >= 0
-              ? Math.round(time_taken_seconds)
-              : null,
-        })
-        .eq("id", attemptId);
+    // 2. Update the attempt row (score, timestamps, time taken)
+    const { error: updateErr } = await supabase
+      .from("quiz_attempts")
+      .update({
+        score: Number(score.toFixed(2)),
+        started_at:
+          started_at ?? existing.started_at ?? new Date().toISOString(),
+        completed_at: completed_at ?? new Date().toISOString(),
+        time_taken_seconds:
+          typeof time_taken_seconds === "number" && time_taken_seconds >= 0
+            ? Math.round(time_taken_seconds)
+            : null,
+      })
+      .eq("id", attemptId);
 
-      if (updateErr) {
-        console.error("update attempt error:", updateErr);
-        return res.status(500).json({
-          error: "Failed to save attempt score",
-          detail: updateErr.message,
-        });
-      }
-
-      // 3. Save attempt_answers rows (upsert: id is attempt_id + question_id)
-      if (answers.length > 0) {
-        const rows = answers
-          .filter(
-            (
-              a,
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            ): a is any =>
-              a && typeof a === "object" && typeof a.question_id === "string",
-          )
-          .map(
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            (a: any) => ({
-              id: `aa_${attemptId}_${a.question_id}`,
-              attempt_id: attemptId,
-              question_id: a.question_id,
-              answer_given:
-                typeof a.given === "string" ? a.given : JSON.stringify(a.given ?? null),
-              correct_answer:
-                typeof a.correct === "string" ? a.correct : JSON.stringify(a.correct ?? ""),
-              is_correct: !!a.is_correct,
-            }),
-          );
-
-        const { error: insertErr } = await supabase
-          .from("attempt_answers")
-          .upsert(rows, { onConflict: "id" });
-
-        if (insertErr) {
-          console.error("insert attempt_answers error:", insertErr);
-          return res.status(500).json({
-            error: "Failed to save answers",
-            detail: insertErr.message,
-          });
-        }
-      }
-
-      // 4. Bump attempt_count on the quiz itself (best-effort, ignore errors)
-      if (existing.quiz_id) {
-        supabase.rpc("increment_attempt_count", { quiz_id_in: existing.quiz_id }).catch(() => void 0);
-      }
-
-      return res.json({ ok: true });
-    } catch (err) {
-      console.error("Attempt complete error:", err);
+    if (updateErr) {
+      console.error("update attempt error:", updateErr);
       return res.status(500).json({
-        error: "Internal server error",
-        detail: err instanceof Error ? err.message : String(err),
+        error: "Failed to save attempt score",
+        detail: updateErr.message,
       });
     }
-  },
-);
+
+    // 3. Save attempt_answers rows (upsert: id is attempt_id + question_id)
+    if (answers.length > 0) {
+      const rows = answers
+        .filter(
+          (a) =>
+            a && typeof a === "object" && typeof a.question_id === "string",
+        )
+        .map((a) => ({
+          id: `aa_${attemptId}_${a.question_id}`,
+          attempt_id: attemptId,
+          question_id: a.question_id,
+          answer_given:
+            typeof a.given === "string"
+              ? a.given
+              : JSON.stringify(a.given ?? null),
+          correct_answer:
+            typeof a.correct === "string"
+              ? a.correct
+              : JSON.stringify(a.correct ?? ""),
+          is_correct: !!a.is_correct,
+        }));
+
+      const { error: insertErr } = await supabase
+        .from("attempt_answers")
+        .upsert(rows, { onConflict: "id" });
+
+      if (insertErr) {
+        console.error("insert attempt_answers error:", insertErr);
+        return res.status(500).json({
+          error: "Failed to save answers",
+          detail: insertErr.message,
+        });
+      }
+    }
+
+    // 4. Bump attempt_count on the quiz itself (best-effort, ignore errors)
+    if (existing.quiz_id) {
+      supabase
+        .rpc("increment_attempt_count", { quiz_id_in: existing.quiz_id })
+        .catch(() => void 0);
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Attempt complete error:", err);
+    return res.status(500).json({
+      error: "Internal server error",
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
 
 app.post(
   "/api/creator/payout-request",
