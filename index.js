@@ -7,8 +7,34 @@ import axios from "axios";
 
 dotenv.config();
 
-const CORS_ALLOWED_ORIGIN =
-  process.env.CORS_ALLOWED_ORIGIN || "https://prepuniv.vercel.app";
+const DEFAULT_CORS_ALLOWED = [
+  "https://prepuniv.vercel.app",
+  "http://localhost:5173",
+  "http://localhost:3000",
+];
+
+const CORS_ALLOWED_LIST: string[] = (() => {
+  const raw = process.env.CORS_ALLOWED_ORIGIN;
+  if (!raw) return DEFAULT_CORS_ALLOWED;
+  const parsed = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const merged = [...parsed];
+  for (const o of DEFAULT_CORS_ALLOWED) {
+    if (!merged.includes(o)) merged.push(o);
+  }
+  return merged;
+})();
+
+function isAllowedOrigin(origin: string | undefined): boolean {
+  if (!origin) return true;
+  const normalized = origin.replace(/\/$/, "");
+  return CORS_ALLOWED_LIST.some(
+    (o) => o.replace(/\/$/, "") === normalized,
+  );
+}
+
 const FLUTTERWAVE_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || "";
 const FLUTTERWAVE_WEBHOOK_SECRET = process.env.FLUTTERWAVE_WEBHOOK_SECRET || "";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -21,8 +47,17 @@ const app = express();
 
 app.use(
   cors({
-    origin: CORS_ALLOWED_ORIGIN,
+    origin: (origin, cb) => {
+      if (isAllowedOrigin(origin)) {
+        cb(null, origin ?? true);
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn("[CORS] blocked origin:", origin, "allowed:", CORS_ALLOWED_LIST);
+        cb(null, CORS_ALLOWED_LIST[0]);
+      }
+    },
     credentials: true,
+    optionsSuccessStatus: 200,
   }),
 );
 
@@ -131,7 +166,7 @@ app.post(
           tx_ref,
           amount,
           currency: "NGN",
-          redirect_url: `${CORS_ALLOWED_ORIGIN}/wallet?tx_ref=${tx_ref}`,
+          redirect_url: `${CORS_ALLOWED_LIST[0]}/wallet?tx_ref=${tx_ref}`,
           customer: {
             email: req.user.email,
           },
@@ -143,7 +178,7 @@ app.post(
         payment_link = response.data?.data?.link;
       } catch (fwErr) {
         console.error("Flutterwave payment init failed:", fwErr.message);
-        payment_link = `${CORS_ALLOWED_ORIGIN}/wallet?tx_ref=${tx_ref}&mock_payment=1`;
+        payment_link = `${CORS_ALLOWED_LIST[0]}/wallet?tx_ref=${tx_ref}&mock_payment=1`;
       }
 
       return res.json({ payment_link, tx_ref });
