@@ -25,7 +25,14 @@ app.use(
     credentials: true,
   }),
 );
-app.use(express.json());
+
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  }),
+);
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
   auth: {
@@ -150,15 +157,20 @@ app.post(
 app.post("/api/webhooks/flutterwave", async (req, res) => {
   try {
     const verifHash = req.headers["verif-hash"];
+    const rawBody = req.rawBody ?? JSON.stringify(req.body);
     const expectedHash = crypto
       .createHmac(
         "sha256",
         FLUTTERWAVE_WEBHOOK_SECRET || FLUTTERWAVE_SECRET_KEY,
       )
-      .update(JSON.stringify(req.body))
+      .update(rawBody)
       .digest("hex");
 
     if (verifHash !== expectedHash) {
+      console.warn("Webhook signature mismatch — ignoring", {
+        verifHash,
+        expectedHash,
+      });
       return res.status(403).json({ error: "Invalid webhook signature" });
     }
 
@@ -177,21 +189,28 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
       const verifyData = verifyResp.data?.data;
       const verifyStatus = verifyData?.status;
 
-      if (verifyStatus === "successful") {
-        const { data: txRow, error: lookupErr } = await supabase
-          .from("wallet_transactions")
-          .select("*")
-          .eq("reference", tx_ref)
-          .eq("status", "pending")
-          .maybeSingle();
+      const { data: txRow, error: lookupErr } = await supabase
+        .from("wallet_transactions")
+        .select("*")
+        .eq("reference", tx_ref)
+        .eq("status", "pending")
+        .maybeSingle();
 
-        if (lookupErr) {
-          console.error("Wallet transaction lookup error:", lookupErr);
-        } else if (txRow) {
-          await supabase
+      if (lookupErr) {
+        console.error("Wallet transaction lookup error:", lookupErr);
+      } else if (txRow) {
+        if (verifyStatus === "successful") {
+          const { error: updateErr } = await supabase
             .from("wallet_transactions")
             .update({ status: "completed" })
             .eq("id", txRow.id);
+          if (updateErr) console.error("Webhook update error:", updateErr);
+        } else if (verifyStatus === "failed") {
+          const { error: updateErr } = await supabase
+            .from("wallet_transactions")
+            .update({ status: "failed" })
+            .eq("id", txRow.id);
+          if (updateErr) console.error("Webhook failed-update error:", updateErr);
         }
       }
     } catch (verifyErr) {
@@ -250,26 +269,23 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
       return res.json({ status: "failed" });
     }
 
-    // Query Flutterwave by tx_ref to get the transaction id + status
+    // Query Flutterwave by tx_ref using the dedicated verify_by_reference endpoint
     let fwStatus = null;
     try {
-      const searchResp = await flutterwaveAxios.get("/transactions", {
-        params: { tx_ref },
-      });
-      const transactions = searchResp.data?.data;
-      if (Array.isArray(transactions) && transactions.length > 0) {
-        const fwTx = transactions[0];
-        const txId = fwTx?.id;
+      const verifyRefResp = await flutterwaveAxios.get(
+        "/transactions/verify_by_reference",
+        { params: { tx_ref } },
+      );
+      const verifyRefData = verifyRefResp.data?.data;
+      const txId = verifyRefData?.id;
 
-        // Re-verify using the transaction id (more authoritative than the search result)
-        if (txId) {
-          const verifyResp = await flutterwaveAxios.get(
-            `/transactions/${txId}/verify`,
-          );
-          fwStatus = verifyResp.data?.data?.status;
-        } else {
-          fwStatus = fwTx?.status;
-        }
+      if (txId) {
+        const verifyResp = await flutterwaveAxios.get(
+          `/transactions/${txId}/verify`,
+        );
+        fwStatus = verifyResp.data?.data?.status;
+      } else {
+        fwStatus = verifyRefData?.status;
       }
     } catch (fwErr) {
       console.error("Flutterwave verify call failed:", fwErr.message);
