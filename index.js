@@ -543,10 +543,12 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
       .eq("id", attemptId);
 
     if (updateErr) {
-      console.error("update attempt error:", updateErr);
+      console.error("update attempt error:", JSON.stringify(updateErr));
       return res.status(500).json({
         error: "Failed to save attempt score",
         detail: updateErr.message,
+        code: updateErr.code,
+        hint: updateErr.hint,
       });
     }
 
@@ -575,10 +577,15 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
         .upsert(rows, { onConflict: "id" });
 
       if (insertErr) {
-        console.error("insert attempt_answers error:", insertErr);
+        console.error(
+          "insert attempt_answers error:",
+          JSON.stringify(insertErr),
+        );
         return res.status(500).json({
           error: "Failed to save answers",
           detail: insertErr.message,
+          code: insertErr.code,
+          hint: insertErr.hint,
         });
       }
     }
