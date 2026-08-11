@@ -564,13 +564,9 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
           question_text:
             typeof a.question_text === "string" ? a.question_text : null,
           answer_given:
-            typeof a.given === "string"
-              ? a.given
-              : JSON.stringify(a.given ?? null),
+            typeof a.given === "string" ? a.given : String(a.given ?? ""),
           correct_answer:
-            typeof a.correct === "string"
-              ? a.correct
-              : JSON.stringify(a.correct ?? ""),
+            typeof a.correct === "string" ? a.correct : String(a.correct ?? ""),
           is_correct: !!a.is_correct,
         }));
 
