@@ -653,6 +653,105 @@ app.delete("/api/attempt/:id", authenticateRequest, async (req, res) => {
   }
 });
 
+// ─── Get Quiz Analytics Data for Creator / Admin ────────────────────────────────
+app.get("/api/quiz/:id/analytics", authenticateRequest, async (req, res) => {
+  try {
+    const { id: quizId } = req.params;
+
+    // 1. Fetch quiz details
+    const { data: quiz, error: quizErr } = await supabase
+      .from("quizzes")
+      .select("*")
+      .eq("id", quizId)
+      .maybeSingle();
+
+    if (quizErr) throw quizErr;
+    if (!quiz) return res.status(404).json({ error: "Quiz not found" });
+
+    // 2. Authorization check: must be owner or admin
+    const isAdmin = req.user.role === "admin";
+    if (quiz.creator_id !== req.user.id && !isAdmin) {
+      return res
+        .status(403)
+        .json({ error: "Unauthorized access to quiz analytics" });
+    }
+
+    // 3. Fetch course, questions, and completed attempts concurrently using backend admin access
+    const [cRes, qRes, aRes] = await Promise.all([
+      quiz.course_id
+        ? supabase
+            .from("courses")
+            .select("*")
+            .eq("id", quiz.course_id)
+            .maybeSingle()
+        : Promise.resolve({ data: null }),
+      supabase
+        .from("questions")
+        .select("*")
+        .eq("quiz_id", quizId)
+        .order("order_index", { ascending: true }),
+      supabase
+        .from("quiz_attempts")
+        .select("*")
+        .eq("quiz_id", quizId)
+        .not("completed_at", "is", null),
+    ]);
+
+    const course = cRes.data ?? null;
+    let questions = qRes.data ?? [];
+    const attempts = aRes.data ?? [];
+
+    // Fallback: If questions table is empty, parse questions from quiz_snapshot of attempts
+    if (questions.length === 0 && attempts.length > 0) {
+      for (const att of attempts) {
+        if (att.quiz_snapshot) {
+          try {
+            const parsed =
+              typeof att.quiz_snapshot === "string"
+                ? JSON.parse(att.quiz_snapshot)
+                : att.quiz_snapshot;
+            if (
+              parsed &&
+              Array.isArray(parsed.questions) &&
+              parsed.questions.length > 0
+            ) {
+              questions = parsed.questions;
+              break;
+            }
+          } catch (e) {
+            /* ignore */
+          }
+        }
+      }
+    }
+
+    // 4. Fetch attempt_answers for all completed attempt IDs
+    const attemptIds = attempts.map((a) => a.id);
+    let attemptAnswers = [];
+    if (attemptIds.length > 0) {
+      const { data: ansData } = await supabase
+        .from("attempt_answers")
+        .select("question_id, is_correct")
+        .in("attempt_id", attemptIds);
+      attemptAnswers = ansData ?? [];
+    }
+
+    return res.json({
+      quiz,
+      course,
+      questions,
+      attempts,
+      attemptAnswers,
+    });
+  } catch (err) {
+    console.error("Quiz analytics error:", err);
+    return res.status(500).json({
+      error: "Internal server error",
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
 app.post(
   "/api/creator/payout-request",
   authenticateRequest,
