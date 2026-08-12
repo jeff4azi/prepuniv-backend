@@ -373,6 +373,155 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
   }
 });
 
+// ─── Nigerian Banks Data & Flutterwave Integration ────────────────────────────
+const STATIC_NIGERIAN_BANKS = [
+  { code: "044", name: "Access Bank" },
+  { code: "023", name: "Citibank Nigeria" },
+  { code: "050", name: "EcoBank Nigeria" },
+  { code: "070", name: "Fidelity Bank" },
+  { code: "011", name: "First Bank of Nigeria" },
+  { code: "214", name: "First City Monument Bank (FCMB)" },
+  { code: "058", name: "GTBank (Guaranty Trust)" },
+  { code: "030", name: "Heritage Bank" },
+  { code: "082", name: "Keystone Bank" },
+  { code: "999992", name: "OPay" },
+  { code: "50211", name: "Kuda Bank" },
+  { code: "076", name: "Polaris Bank" },
+  { code: "039", name: "Stanbic IBTC Bank" },
+  { code: "232", name: "Sterling Bank" },
+  { code: "033", name: "United Bank for Africa (UBA)" },
+  { code: "035", name: "Wema Bank" },
+  { code: "057", name: "Zenith Bank" },
+];
+
+let cachedBanksList = null;
+let cachedBanksListTime = 0;
+const BANK_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// ─── Get Nigerian Banks List (Flutterwave API with 24h cache) ─────────────────
+app.get("/api/banks", async (req, res) => {
+  try {
+    const now = Date.now();
+    if (cachedBanksList && now - cachedBanksListTime < BANK_CACHE_TTL) {
+      return res.json({ status: "success", data: cachedBanksList, source: "cache" });
+    }
+
+    if (FLUTTERWAVE_SECRET_KEY) {
+      try {
+        const response = await axios.get("https://api.flutterwave.com/v3/banks/NG", {
+          headers: {
+            Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
+          },
+          timeout: 10000,
+        });
+
+        if (
+          response.data &&
+          response.data.status === "success" &&
+          Array.isArray(response.data.data)
+        ) {
+          const banks = response.data.data.map((b) => ({
+            id: String(b.id || b.code),
+            code: String(b.code),
+            name: String(b.name),
+          }));
+          cachedBanksList = banks;
+          cachedBanksListTime = now;
+          return res.json({ status: "success", data: banks, source: "flutterwave" });
+        }
+      } catch (flwErr) {
+        console.warn(
+          "Flutterwave fetch banks error, using static fallback:",
+          flwErr.message,
+        );
+      }
+    }
+
+    return res.json({
+      status: "success",
+      data: STATIC_NIGERIAN_BANKS,
+      source: "static",
+    });
+  } catch (err) {
+    console.error("Get banks error:", err);
+    return res.status(500).json({ error: "Failed to fetch banks list" });
+  }
+});
+
+// ─── Resolve Account Details (Flutterwave Account Verification) ────────────────
+app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
+  try {
+    const { accountNumber, bankCode } = req.body || {};
+
+    if (!accountNumber || !/^\d{10}$/.test(accountNumber) || !bankCode) {
+      return res
+        .status(400)
+        .json({ error: "Invalid 10-digit account number or bank code" });
+    }
+
+    if (FLUTTERWAVE_SECRET_KEY) {
+      try {
+        const response = await axios.post(
+          "https://api.flutterwave.com/v3/accounts/resolve",
+          {
+            account_number: accountNumber,
+            account_bank: bankCode,
+          },
+          {
+            headers: {
+              Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
+              "Content-Type": "application/json",
+            },
+            timeout: 12000,
+          },
+        );
+
+        if (
+          response.data &&
+          (response.data.status === "success" || response.data.data?.account_name)
+        ) {
+          const accountName = response.data.data?.account_name || "";
+          if (accountName) {
+            return res.json({
+              success: true,
+              accountName: accountName.toUpperCase(),
+              accountNumber,
+              bankCode,
+            });
+          }
+        }
+      } catch (flwErr) {
+        console.warn(
+          "Flutterwave resolve error:",
+          flwErr.response?.data || flwErr.message,
+        );
+        const errMsg =
+          flwErr.response?.data?.message ||
+          "Could not verify account — please check account number and bank selected.";
+        return res.status(400).json({ error: errMsg });
+      }
+    }
+
+    // Mock fallback when FLW key is not set or in offline demo mode
+    const mockName =
+      req.user.user_metadata?.full_name?.toUpperCase() ||
+      req.user.email?.split("@")[0]?.toUpperCase() ||
+      "ACCOUNT HOLDER";
+
+    return res.json({
+      success: true,
+      accountName: mockName,
+      accountNumber,
+      bankCode,
+    });
+  } catch (err) {
+    console.error("Resolve bank error:", err);
+    return res
+      .status(500)
+      .json({ error: "Internal server error resolving account" });
+  }
+});
+
 // ─── Sync Quiz Version Helper ──────────────────────────────────────────────────
 async function syncQuizVersion(quizId) {
   try {
