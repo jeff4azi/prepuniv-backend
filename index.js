@@ -632,6 +632,27 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
   }
 });
 
+// ─── Delete / Abandon an uncompleted attempt ──────────────────────────────────
+app.delete("/api/attempt/:id", authenticateRequest, async (req, res) => {
+  try {
+    const { id: attemptId } = req.params;
+    const { error } = await supabase
+      .from("quiz_attempts")
+      .delete()
+      .eq("id", attemptId)
+      .eq("user_id", req.user.id)
+      .is("completed_at", null);
+
+    if (error) {
+      console.error("Delete attempt error:", error);
+      return res.status(500).json({ error: "Failed to delete attempt" });
+    }
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.post(
   "/api/creator/payout-request",
   authenticateRequest,
