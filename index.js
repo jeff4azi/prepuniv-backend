@@ -365,7 +365,6 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
 
       return res.json({ status: "failed" });
     }
-
     // Still processing on Flutterwave's end
     return res.json({ status: "pending" });
   } catch (err) {
@@ -374,36 +373,118 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
   }
 });
 
+// ─── Sync Quiz Version Helper ──────────────────────────────────────────────────
+async function syncQuizVersion(quizId) {
+  try {
+    const { data: questions, error: qErr } = await supabase
+      .from("questions")
+      .select("id, type, question_text, options, correct_answer, order_index")
+      .eq("quiz_id", quizId)
+      .order("order_index", { ascending: true });
+
+    if (qErr) {
+      console.error("syncQuizVersion fetch questions error:", qErr);
+      throw qErr;
+    }
+
+    const currentQuestions = (questions || []).map((q) => ({
+      id: String(q.id),
+      type: String(q.type || "mcq"),
+      question_text: String(q.question_text || ""),
+      options: q.options ?? null,
+      correct_answer: q.correct_answer ?? "",
+      order_index: Number(q.order_index || 0),
+    }));
+
+    const { data: latestVersion, error: vErr } = await supabase
+      .from("quiz_versions")
+      .select("*")
+      .eq("quiz_id", quizId)
+      .order("version_number", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (vErr) {
+      console.error("syncQuizVersion fetch latest version error:", vErr);
+    }
+
+    let isDifferent = false;
+    if (!latestVersion) {
+      isDifferent = true;
+    } else {
+      const prevSnapshot =
+        typeof latestVersion.questions_snapshot === "string"
+          ? JSON.parse(latestVersion.questions_snapshot)
+          : latestVersion.questions_snapshot;
+
+      if (JSON.stringify(currentQuestions) !== JSON.stringify(prevSnapshot)) {
+        isDifferent = true;
+      }
+    }
+
+    if (isDifferent) {
+      const nextVersionNum = (latestVersion?.version_number || 0) + 1;
+      const { data: newVersion, error: insertErr } = await supabase
+        .from("quiz_versions")
+        .insert({
+          quiz_id: quizId,
+          version_number: nextVersionNum,
+          questions_snapshot: currentQuestions,
+          question_count: currentQuestions.length,
+        })
+        .select()
+        .single();
+
+      if (insertErr) {
+        console.error("syncQuizVersion insert version error:", insertErr);
+        const { data: fallback } = await supabase
+          .from("quiz_versions")
+          .select("*")
+          .eq("quiz_id", quizId)
+          .order("version_number", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        return fallback || latestVersion;
+      }
+      return newVersion;
+    }
+
+    return latestVersion;
+  } catch (err) {
+    console.error("syncQuizVersion error:", err);
+    return null;
+  }
+}
+
+// ─── Start / Retake a Quiz (creates a attempt row) ──────────────────────────
 app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
   try {
-    const { id: quiz_id } = req.params;
-    const { is_timed, time_allowed_seconds } = req.body;
+    const { id: quizId } = req.params;
+    const { is_timed, time_allowed_seconds } = req.body || {};
 
     const { data: quiz, error: quizErr } = await supabase
       .from("quizzes")
       .select("*")
-      .eq("id", quiz_id)
-      .single();
+      .eq("id", quizId)
+      .maybeSingle();
 
-    if (quizErr || !quiz) {
-      return res.status(404).json({ error: "Quiz not found" });
-    }
+    if (quizErr) throw quizErr;
+    if (!quiz) return res.status(404).json({ error: "Quiz not found" });
 
-    // Check if the user has already paid for this quiz (prior completed quiz_payment txn)
-    const { data: priorPayment } = await supabase
+    // Check if user has already paid for this quiz
+    const { data: existingPay } = await supabase
       .from("wallet_transactions")
       .select("id")
       .eq("user_id", req.user.id)
+      .eq("related_quiz_id", quiz.id)
       .eq("type", "quiz_payment")
       .eq("status", "completed")
-      .eq("related_quiz_id", quiz_id)
-      .limit(1)
       .maybeSingle();
 
-    const alreadyPaid = !!priorPayment;
+    const isFirstTime = !existingPay;
+    const version = await syncQuizVersion(quiz.id);
 
-    if (!alreadyPaid) {
-      // First-time purchase — check balance and debit wallet
+    if (isFirstTime) {
       const { data: balanceRow, error: balanceErr } = await supabase
         .from("user_balances")
         .select("*")
@@ -428,26 +509,16 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       const payRef = "quizpay_" + crypto.randomUUID();
       const paymentTxnId = "wtx_" + crypto.randomUUID();
 
-      const { error: payErr } = await supabase
-        .from("wallet_transactions")
-        .insert({
-          id: paymentTxnId,
-          user_id: req.user.id,
-          amount: -priceNaira,
-          type: "quiz_payment",
-          status: "completed",
-          reference: payRef,
-          related_quiz_id: quiz.id,
-          related_attempt_id: attemptId,
-        });
-
-      if (payErr) {
-        console.error("Wallet txn insert error:", payErr);
-        return res.status(500).json({
-          error: "Failed to process payment",
-          detail: payErr.message,
-        });
-      }
+      await supabase.from("wallet_transactions").insert({
+        id: paymentTxnId,
+        user_id: req.user.id,
+        amount: -priceNaira,
+        type: "quiz_payment",
+        status: "completed",
+        reference: payRef,
+        related_quiz_id: quiz.id,
+        related_attempt_id: attemptId,
+      });
 
       const { data: attempt, error: attemptErr } = await supabase
         .from("quiz_attempts")
@@ -455,6 +526,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
           id: attemptId,
           user_id: req.user.id,
           quiz_id: quiz.id,
+          quiz_version_id: version?.id || null,
           is_timed: !!is_timed,
           time_allowed_seconds: is_timed
             ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) ||
@@ -464,18 +536,13 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
         .select()
         .single();
 
-      if (attemptErr || !attempt) {
-        console.error("Quiz attempt insert error:", attemptErr);
-        return res.status(500).json({
-          error: "Failed to create quiz attempt",
-          detail: attemptErr?.message,
-        });
-      }
+      if (attemptErr) throw attemptErr;
 
       return res.json({
         attempt_id: attempt.id,
         quiz_id: attempt.quiz_id,
-        quiz_snapshot: attempt.quiz_snapshot || null,
+        quiz_version_id: attempt.quiz_version_id,
+        questions: version?.questions_snapshot || [],
         ...attempt,
       });
     } else {
@@ -488,6 +555,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
           id: attemptId,
           user_id: req.user.id,
           quiz_id: quiz.id,
+          quiz_version_id: version?.id || null,
           is_timed: !!is_timed,
           time_allowed_seconds: is_timed
             ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) ||
@@ -497,18 +565,13 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
         .select()
         .single();
 
-      if (attemptErr || !attempt) {
-        console.error("Quiz attempt insert error (retake):", attemptErr);
-        return res.status(500).json({
-          error: "Failed to create quiz attempt",
-          detail: attemptErr?.message,
-        });
-      }
+      if (attemptErr) throw attemptErr;
 
       return res.json({
         attempt_id: attempt.id,
         quiz_id: attempt.quiz_id,
-        quiz_snapshot: attempt.quiz_snapshot || null,
+        quiz_version_id: attempt.quiz_version_id,
+        questions: version?.questions_snapshot || [],
         ...attempt,
       });
     }
@@ -528,12 +591,7 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
     const { score, started_at, completed_at, time_taken_seconds, answers } =
       req.body;
 
-    if (
-      typeof score !== "number" ||
-      score < 0 ||
-      score > 100 ||
-      !Array.isArray(answers)
-    ) {
+    if (typeof score !== "number" || score < 0 || score > 100) {
       return res.status(400).json({ error: "Invalid payload" });
     }
 
@@ -550,7 +608,19 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
       return res.status(403).json({ error: "Not your attempt" });
     }
 
-    // 2. Update the attempt row (score, timestamps, time taken)
+    let answersMap = {};
+    if (Array.isArray(answers)) {
+      for (const a of answers) {
+        if (a && typeof a === "object" && typeof a.question_id === "string") {
+          answersMap[a.question_id] =
+            typeof a.given === "string" ? a.given : String(a.given ?? "");
+        }
+      }
+    } else if (answers && typeof answers === "object") {
+      answersMap = answers;
+    }
+
+    // 2. Update the attempt row (score, timestamps, time taken, answers JSONB)
     const { error: updateErr } = await supabase
       .from("quiz_attempts")
       .update({
@@ -562,6 +632,7 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
           typeof time_taken_seconds === "number" && time_taken_seconds >= 0
             ? Math.round(time_taken_seconds)
             : null,
+        answers: answersMap,
       })
       .eq("id", attemptId);
 
@@ -575,8 +646,8 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
       });
     }
 
-    // 3. Save attempt_answers rows (upsert: id is attempt_id + question_id)
-    if (answers.length > 0) {
+    // 3. Save attempt_answers rows for backwards compatibility
+    if (Array.isArray(answers) && answers.length > 0) {
       const rows = answers
         .filter(
           (a) =>
@@ -604,12 +675,6 @@ app.post("/api/attempt/:id/complete", authenticateRequest, async (req, res) => {
           "insert attempt_answers error:",
           JSON.stringify(insertErr),
         );
-        return res.status(500).json({
-          error: "Failed to save answers",
-          detail: insertErr.message,
-          code: insertErr.code,
-          hint: insertErr.hint,
-        });
       }
     }
 
@@ -676,8 +741,8 @@ app.get("/api/quiz/:id/analytics", authenticateRequest, async (req, res) => {
         .json({ error: "Unauthorized access to quiz analytics" });
     }
 
-    // 3. Fetch course, questions, and completed attempts concurrently using backend admin access
-    const [cRes, qRes, aRes] = await Promise.all([
+    // 3. Fetch course, versions, questions, and completed attempts concurrently using backend admin access
+    const [cRes, vRes, qRes, aRes] = await Promise.all([
       quiz.course_id
         ? supabase
             .from("courses")
@@ -685,6 +750,11 @@ app.get("/api/quiz/:id/analytics", authenticateRequest, async (req, res) => {
             .eq("id", quiz.course_id)
             .maybeSingle()
         : Promise.resolve({ data: null }),
+      supabase
+        .from("quiz_versions")
+        .select("*")
+        .eq("quiz_id", quizId)
+        .order("version_number", { ascending: false }),
       supabase
         .from("questions")
         .select("*")
@@ -698,31 +768,17 @@ app.get("/api/quiz/:id/analytics", authenticateRequest, async (req, res) => {
     ]);
 
     const course = cRes.data ?? null;
+    const versions = vRes.data ?? [];
     let questions = qRes.data ?? [];
     const attempts = aRes.data ?? [];
 
-    // Fallback: If questions table is empty, parse questions from quiz_snapshot of attempts
-    if (questions.length === 0 && attempts.length > 0) {
-      for (const att of attempts) {
-        if (att.quiz_snapshot) {
-          try {
-            const parsed =
-              typeof att.quiz_snapshot === "string"
-                ? JSON.parse(att.quiz_snapshot)
-                : att.quiz_snapshot;
-            if (
-              parsed &&
-              Array.isArray(parsed.questions) &&
-              parsed.questions.length > 0
-            ) {
-              questions = parsed.questions;
-              break;
-            }
-          } catch (e) {
-            /* ignore */
-          }
-        }
-      }
+    // Fallback: If questions table is empty, use latest version's questions_snapshot
+    if (questions.length === 0 && versions.length > 0) {
+      const latestSnapshot = versions[0].questions_snapshot;
+      questions =
+        typeof latestSnapshot === "string"
+          ? JSON.parse(latestSnapshot)
+          : latestSnapshot;
     }
 
     // 4. Fetch attempt_answers for all completed attempt IDs
@@ -739,6 +795,7 @@ app.get("/api/quiz/:id/analytics", authenticateRequest, async (req, res) => {
     return res.json({
       quiz,
       course,
+      versions,
       questions,
       attempts,
       attemptAnswers,
