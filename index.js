@@ -460,12 +460,58 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
     }
 
     if (FLUTTERWAVE_SECRET_KEY) {
+      // Resolve the correct Flutterwave bank code by fetching their bank list
+      let resolvedBankCode = bankCode;
+      try {
+        // Reuse the cached bank list or fetch fresh from Flutterwave
+        const now = Date.now();
+        if (!cachedBanksList || now - cachedBanksListTime >= BANK_CACHE_TTL) {
+          const banksResponse = await axios.get("https://api.flutterwave.com/v3/banks/NG", {
+            headers: { Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}` },
+            timeout: 10000,
+          });
+          if (banksResponse.data?.status === "success" && Array.isArray(banksResponse.data.data)) {
+            cachedBanksList = banksResponse.data.data.map((b) => ({
+              id: String(b.id || b.code),
+              code: String(b.code),
+              name: String(b.name),
+            }));
+            cachedBanksListTime = now;
+          }
+        }
+
+        // Look up the bank in the Flutterwave list to get the correct code
+        if (cachedBanksList && cachedBanksList.length > 0) {
+          // First try exact code match
+          const exactMatch = cachedBanksList.find((b) => b.code === bankCode);
+          if (exactMatch) {
+            resolvedBankCode = exactMatch.code;
+          } else {
+            // If code not found, try to match by name from our static list
+            const staticBank = STATIC_NIGERIAN_BANKS.find((b) => b.code === bankCode);
+            if (staticBank) {
+              const nameMatch = cachedBanksList.find(
+                (b) => b.name.toLowerCase().includes(staticBank.name.toLowerCase()) ||
+                       staticBank.name.toLowerCase().includes(b.name.toLowerCase())
+              );
+              if (nameMatch) {
+                resolvedBankCode = nameMatch.code;
+                console.log(`Resolved static bank code ${bankCode} (${staticBank.name}) to Flutterwave code ${nameMatch.code} (${nameMatch.name})`);
+              }
+            }
+          }
+        }
+      } catch (bankListErr) {
+        console.warn("Could not fetch Flutterwave bank list for code resolution:", bankListErr.message);
+        // Continue with the original code
+      }
+
       try {
         const response = await axios.post(
           "https://api.flutterwave.com/v3/accounts/resolve",
           {
             account_number: accountNumber,
-            account_bank: bankCode,
+            account_bank: resolvedBankCode,
           },
           {
             headers: {
@@ -495,9 +541,12 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
           "Flutterwave resolve error:",
           flwErr.response?.data || flwErr.message,
         );
+        const rawMsg = flwErr.response?.data?.message || "";
+        // Provide a user-friendly error instead of exposing Flutterwave internals
         const errMsg =
-          flwErr.response?.data?.message ||
-          "Could not verify account — please check account number and bank selected.";
+          rawMsg.includes("destbankcode") || rawMsg.includes("account_bank")
+            ? "This bank is not currently supported for account verification. Please try a different bank or contact support."
+            : rawMsg || "Could not verify account — please check account number and bank selected.";
         return res.status(400).json({ error: errMsg });
       }
     }
