@@ -1393,6 +1393,225 @@ app.post(
   },
 );
 
+// ─── Admin Management Endpoints ─────────────────────────────────────────────
+
+// GET /api/admin/users — profiles + auth emails
+app.get("/api/admin/users", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { data: profiles, error: profErr } = await supabase
+      .from("profiles")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (profErr) return res.status(500).json({ error: "Failed to fetch profiles" });
+
+    const { data: authData, error: authErr } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+    const emailMap = {};
+    if (!authErr && authData?.users) {
+      authData.users.forEach((u) => { emailMap[u.id] = u.email; });
+    }
+
+    const enriched = (profiles || []).map((p) => ({
+      ...p,
+      email: emailMap[p.id] || null,
+    }));
+
+    return res.json({ users: enriched });
+  } catch (err) {
+    console.error("Admin get users error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/admin/users/:id/suspend — toggle suspension
+app.post("/api/admin/users/:id/suspend", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { suspend } = req.body;
+
+    const { error } = await supabase
+      .from("profiles")
+      .update({ is_suspended: !!suspend })
+      .eq("id", id);
+
+    if (error) return res.status(500).json({ error: "Failed to update suspension status" });
+    return res.json({ ok: true, is_suspended: !!suspend });
+  } catch (err) {
+    console.error("Admin suspend user error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/admin/quizzes/:id/unpublish — admin force-unpublish
+app.post("/api/admin/quizzes/:id/unpublish", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from("quizzes")
+      .update({ is_published: false, unpublished_by_admin: true })
+      .eq("id", id);
+    if (error) return res.status(500).json({ error: "Failed to unpublish quiz" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Admin unpublish quiz error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/admin/quizzes/:id/republish — admin re-publish
+app.post("/api/admin/quizzes/:id/republish", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { error } = await supabase
+      .from("quizzes")
+      .update({ is_published: true, unpublished_by_admin: false })
+      .eq("id", id);
+    if (error) return res.status(500).json({ error: "Failed to republish quiz" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Admin republish quiz error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/admin/reports/:id/resolve
+app.post("/api/admin/reports/:id/resolve", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+    const { error } = await supabase
+      .from("reports")
+      .update({
+        status: "resolved",
+        resolved_at: new Date().toISOString(),
+        details: notes || null,
+      })
+      .eq("id", id);
+    if (error) return res.status(500).json({ error: "Failed to resolve report" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Admin resolve report error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/admin/reports/:id/dismiss
+app.post("/api/admin/reports/:id/dismiss", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+    const { error } = await supabase
+      .from("reports")
+      .update({
+        status: "dismissed",
+        resolved_at: new Date().toISOString(),
+        details: notes || null,
+      })
+      .eq("id", id);
+    if (error) return res.status(500).json({ error: "Failed to dismiss report" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Admin dismiss report error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// PUT /api/admin/courses/:id — update course metadata
+app.put("/api/admin/courses/:id", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { code, name, subject_area, level } = req.body;
+    const updates = {};
+    if (code !== undefined) updates.code = code;
+    if (name !== undefined) updates.name = name;
+    if (subject_area !== undefined) updates.subject_area = subject_area;
+    if (level !== undefined) updates.level = level;
+
+    const { data, error } = await supabase
+      .from("courses")
+      .update(updates)
+      .eq("id", id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "Failed to update course" });
+    return res.json({ course: data });
+  } catch (err) {
+    console.error("Admin update course error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/admin/universities — add university
+app.post("/api/admin/universities", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { name, abbreviation, state } = req.body;
+    if (!name || !abbreviation) {
+      return res.status(400).json({ error: "Name and abbreviation are required" });
+    }
+    const uniId = `uni_${Date.now()}`;
+    const { data, error } = await supabase
+      .from("universities")
+      .insert({ id: uniId, name, abbreviation, state: state || null })
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: error.message || "Failed to add university" });
+    return res.json({ university: data });
+  } catch (err) {
+    console.error("Admin add university error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// PUT /api/admin/universities/:id — update university
+app.put("/api/admin/universities/:id", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, abbreviation, state } = req.body;
+    const updates = {};
+    if (name !== undefined) updates.name = name;
+    if (abbreviation !== undefined) updates.abbreviation = abbreviation;
+    if (state !== undefined) updates.state = state;
+
+    const { data, error } = await supabase
+      .from("universities")
+      .update(updates)
+      .eq("id", id)
+      .select()
+      .single();
+    if (error) return res.status(500).json({ error: "Failed to update university" });
+    return res.json({ university: data });
+  } catch (err) {
+    console.error("Admin update university error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// DELETE /api/admin/universities/:id — delete university (only if no deps)
+app.delete("/api/admin/universities/:id", authenticateRequest, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const [profilesRes, coursesRes, quizzesRes] = await Promise.all([
+      supabase.from("profiles").select("id", { count: "exact", head: true }).eq("university_id", id),
+      supabase.from("courses").select("id", { count: "exact", head: true }).eq("university_id", id),
+      supabase.from("quizzes").select("id", { count: "exact", head: true }).eq("university_id", id),
+    ]);
+
+    const deps = (profilesRes.count || 0) + (coursesRes.count || 0) + (quizzesRes.count || 0);
+    if (deps > 0) {
+      return res.status(409).json({
+        error: `Cannot delete: ${profilesRes.count || 0} users, ${coursesRes.count || 0} courses, and ${quizzesRes.count || 0} quizzes are linked to this university.`,
+      });
+    }
+
+    const { error } = await supabase.from("universities").delete().eq("id", id);
+    if (error) return res.status(500).json({ error: "Failed to delete university" });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("Admin delete university error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 app.post("/api/bank/resolve-account", authenticateRequest, async (req, res) => {
   try {
     const { account_number, bank_code } = req.body;
