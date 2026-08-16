@@ -1650,7 +1650,7 @@ app.post(
         .update({
           status: "resolved",
           resolved_at: new Date().toISOString(),
-          details: notes || null,
+          resolution_notes: notes || null,
         })
         .eq("id", id);
       if (error)
@@ -1677,7 +1677,7 @@ app.post(
         .update({
           status: "dismissed",
           resolved_at: new Date().toISOString(),
-          details: notes || null,
+          resolution_notes: notes || null,
         })
         .eq("id", id);
       if (error)
@@ -1685,6 +1685,60 @@ app.post(
       return res.json({ ok: true });
     } catch (err) {
       console.error("Admin dismiss report error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+// POST /api/creator/reports/:id/acknowledge
+// Creator marks a resolved-with-feedback report as addressed ("I fixed it").
+// Only the creator who owns the quiz may call this, and only on non-open reports.
+app.post(
+  "/api/creator/reports/:id/acknowledge",
+  authenticateRequest,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const callerId = req.user.id;
+
+      // Verify the report exists and belongs to a quiz owned by this creator
+      const { data: report, error: fetchErr } = await supabase
+        .from("reports")
+        .select("id, status, quiz_id")
+        .eq("id", id)
+        .maybeSingle();
+
+      if (fetchErr || !report) {
+        return res.status(404).json({ error: "Report not found" });
+      }
+      if (report.status === "open") {
+        return res
+          .status(400)
+          .json({ error: "Cannot acknowledge an open report" });
+      }
+
+      // Confirm caller owns the quiz
+      const { data: quiz } = await supabase
+        .from("quizzes")
+        .select("creator_id")
+        .eq("id", report.quiz_id)
+        .maybeSingle();
+
+      if (!quiz || quiz.creator_id !== callerId) {
+        return res.status(403).json({ error: "Forbidden: not your quiz" });
+      }
+
+      const { error: updateErr } = await supabase
+        .from("reports")
+        .update({ creator_acknowledged: true })
+        .eq("id", id);
+
+      if (updateErr)
+        return res.status(500).json({ error: "Failed to acknowledge report" });
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("Creator acknowledge report error:", err);
       return res.status(500).json({ error: "Internal server error" });
     }
   },
