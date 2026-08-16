@@ -75,32 +75,47 @@ const authenticateRequest = async (req, res, next) => {
     const { data, error } = await supabase.auth.getUser(token);
     if (!error && data?.user) {
       req.user = data.user;
-      return next();
-    }
-
-    // Fallback: decode JWT payload directly if getUser fails or for dev/test tokens
-    if (token) {
-      try {
-        const parts = token.split(".");
-        if (parts.length === 3) {
-          const payload = JSON.parse(
-            Buffer.from(parts[1], "base64").toString("utf8"),
-          );
-          if (payload && payload.sub) {
-            req.user = {
-              id: payload.sub,
-              email: payload.email || "user@prepuniv.com",
-              role: payload.role || "authenticated",
-            };
-            return next();
+    } else {
+      // Fallback: decode JWT payload directly if getUser fails or for dev/test tokens
+      if (token) {
+        try {
+          const parts = token.split(".");
+          if (parts.length === 3) {
+            const payload = JSON.parse(
+              Buffer.from(parts[1], "base64").toString("utf8"),
+            );
+            if (payload && payload.sub) {
+              req.user = {
+                id: payload.sub,
+                email: payload.email || "user@prepuniv.com",
+                role: payload.role || "authenticated",
+              };
+            }
           }
+        } catch (jwtErr) {
+          console.warn("JWT fallback decode error:", jwtErr.message);
         }
-      } catch (jwtErr) {
-        console.warn("JWT fallback decode error:", jwtErr.message);
+      }
+
+      if (!req.user) {
+        return res.status(401).json({ error: "Unauthorized: invalid token" });
       }
     }
 
-    return res.status(401).json({ error: "Unauthorized: invalid token" });
+    // ── Suspension check: reject every protected request for suspended users ──
+    // Admins are never suspended (enforced on the suspend route itself), but we
+    // check the DB flag unconditionally here as a hard enforcement layer.
+    const { data: profileRow } = await supabase
+      .from("profiles")
+      .select("is_suspended, role")
+      .eq("id", req.user.id)
+      .maybeSingle();
+
+    if (profileRow?.is_suspended === true) {
+      return res.status(403).json({ error: "account_suspended" });
+    }
+
+    return next();
   } catch (err) {
     return res
       .status(401)
@@ -403,17 +418,24 @@ app.get("/api/banks", async (req, res) => {
   try {
     const now = Date.now();
     if (cachedBanksList && now - cachedBanksListTime < BANK_CACHE_TTL) {
-      return res.json({ status: "success", data: cachedBanksList, source: "cache" });
+      return res.json({
+        status: "success",
+        data: cachedBanksList,
+        source: "cache",
+      });
     }
 
     if (FLUTTERWAVE_SECRET_KEY) {
       try {
-        const response = await axios.get("https://api.flutterwave.com/v3/banks/NG", {
-          headers: {
-            Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
+        const response = await axios.get(
+          "https://api.flutterwave.com/v3/banks/NG",
+          {
+            headers: {
+              Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
+            },
+            timeout: 10000,
           },
-          timeout: 10000,
-        });
+        );
 
         if (
           response.data &&
@@ -427,7 +449,11 @@ app.get("/api/banks", async (req, res) => {
           }));
           cachedBanksList = banks;
           cachedBanksListTime = now;
-          return res.json({ status: "success", data: banks, source: "flutterwave" });
+          return res.json({
+            status: "success",
+            data: banks,
+            source: "flutterwave",
+          });
         }
       } catch (flwErr) {
         console.warn(
@@ -466,11 +492,17 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
         // Reuse the cached bank list or fetch fresh from Flutterwave
         const now = Date.now();
         if (!cachedBanksList || now - cachedBanksListTime >= BANK_CACHE_TTL) {
-          const banksResponse = await axios.get("https://api.flutterwave.com/v3/banks/NG", {
-            headers: { Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}` },
-            timeout: 10000,
-          });
-          if (banksResponse.data?.status === "success" && Array.isArray(banksResponse.data.data)) {
+          const banksResponse = await axios.get(
+            "https://api.flutterwave.com/v3/banks/NG",
+            {
+              headers: { Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}` },
+              timeout: 10000,
+            },
+          );
+          if (
+            banksResponse.data?.status === "success" &&
+            Array.isArray(banksResponse.data.data)
+          ) {
             cachedBanksList = banksResponse.data.data.map((b) => ({
               id: String(b.id || b.code),
               code: String(b.code),
@@ -488,21 +520,31 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
             resolvedBankCode = exactMatch.code;
           } else {
             // If code not found, try to match by name from our static list
-            const staticBank = STATIC_NIGERIAN_BANKS.find((b) => b.code === bankCode);
+            const staticBank = STATIC_NIGERIAN_BANKS.find(
+              (b) => b.code === bankCode,
+            );
             if (staticBank) {
               const nameMatch = cachedBanksList.find(
-                (b) => b.name.toLowerCase().includes(staticBank.name.toLowerCase()) ||
-                       staticBank.name.toLowerCase().includes(b.name.toLowerCase())
+                (b) =>
+                  b.name
+                    .toLowerCase()
+                    .includes(staticBank.name.toLowerCase()) ||
+                  staticBank.name.toLowerCase().includes(b.name.toLowerCase()),
               );
               if (nameMatch) {
                 resolvedBankCode = nameMatch.code;
-                console.log(`Resolved static bank code ${bankCode} (${staticBank.name}) to Flutterwave code ${nameMatch.code} (${nameMatch.name})`);
+                console.log(
+                  `Resolved static bank code ${bankCode} (${staticBank.name}) to Flutterwave code ${nameMatch.code} (${nameMatch.name})`,
+                );
               }
             }
           }
         }
       } catch (bankListErr) {
-        console.warn("Could not fetch Flutterwave bank list for code resolution:", bankListErr.message);
+        console.warn(
+          "Could not fetch Flutterwave bank list for code resolution:",
+          bankListErr.message,
+        );
         // Continue with the original code
       }
 
@@ -524,7 +566,8 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
 
         if (
           response.data &&
-          (response.data.status === "success" || response.data.data?.account_name)
+          (response.data.status === "success" ||
+            response.data.data?.account_name)
         ) {
           const accountName = response.data.data?.account_name || "";
           if (accountName) {
@@ -546,7 +589,8 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
         const errMsg =
           rawMsg.includes("destbankcode") || rawMsg.includes("account_bank")
             ? "This bank is not currently supported for account verification. Please try a different bank or contact support."
-            : rawMsg || "Could not verify account — please check account number and bank selected.";
+            : rawMsg ||
+              "Could not verify account — please check account number and bank selected.";
         return res.status(400).json({ error: errMsg });
       }
     }
@@ -1396,221 +1440,395 @@ app.post(
 // ─── Admin Management Endpoints ─────────────────────────────────────────────
 
 // GET /api/admin/users — profiles + auth emails
-app.get("/api/admin/users", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { data: profiles, error: profErr } = await supabase
-      .from("profiles")
-      .select("*")
-      .order("created_at", { ascending: false });
-    if (profErr) return res.status(500).json({ error: "Failed to fetch profiles" });
+app.get(
+  "/api/admin/users",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { data: profiles, error: profErr } = await supabase
+        .from("profiles")
+        .select("*")
+        .order("created_at", { ascending: false });
+      if (profErr)
+        return res.status(500).json({ error: "Failed to fetch profiles" });
 
-    const { data: authData, error: authErr } = await supabase.auth.admin.listUsers({ perPage: 1000 });
-    const emailMap = {};
-    if (!authErr && authData?.users) {
-      authData.users.forEach((u) => { emailMap[u.id] = u.email; });
+      const { data: authData, error: authErr } =
+        await supabase.auth.admin.listUsers({ perPage: 1000 });
+      const emailMap = {};
+      if (!authErr && authData?.users) {
+        authData.users.forEach((u) => {
+          emailMap[u.id] = u.email;
+        });
+      }
+
+      const enriched = (profiles || []).map((p) => ({
+        ...p,
+        email: emailMap[p.id] || null,
+      }));
+
+      return res.json({ users: enriched });
+    } catch (err) {
+      console.error("Admin get users error:", err);
+      return res.status(500).json({ error: "Internal server error" });
     }
-
-    const enriched = (profiles || []).map((p) => ({
-      ...p,
-      email: emailMap[p.id] || null,
-    }));
-
-    return res.json({ users: enriched });
-  } catch (err) {
-    console.error("Admin get users error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+  },
+);
 
 // POST /api/admin/users/:id/suspend — toggle suspension
-app.post("/api/admin/users/:id/suspend", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { suspend } = req.body;
+// On suspend:   hides creator quizzes (snapshots which were live), force-revokes sessions.
+// On unsuspend: restores only the quizzes that were published before suspension.
+app.post(
+  "/api/admin/users/:id/suspend",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { suspend } = req.body;
 
-    const { error } = await supabase
-      .from("profiles")
-      .update({ is_suspended: !!suspend })
-      .eq("id", id);
+      // Fetch target profile to validate and branch logic
+      const { data: targetProfile, error: profileFetchErr } = await supabase
+        .from("profiles")
+        .select("role, is_suspended, is_approved_creator")
+        .eq("id", id)
+        .maybeSingle();
 
-    if (error) return res.status(500).json({ error: "Failed to update suspension status" });
-    return res.json({ ok: true, is_suspended: !!suspend });
-  } catch (err) {
-    console.error("Admin suspend user error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+      if (profileFetchErr || !targetProfile) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      // Admins cannot be suspended
+      if (targetProfile.role === "admin") {
+        return res
+          .status(403)
+          .json({ error: "Admin accounts cannot be suspended" });
+      }
+
+      if (suspend) {
+        // ── SUSPENDING ────────────────────────────────────────────────────────
+
+        // 1. Snapshot + hide creator's quizzes
+        if (targetProfile.is_approved_creator) {
+          // Mark currently-published quizzes so unsuspend can restore them
+          await supabase
+            .from("quizzes")
+            .update({ was_published_before_suspension: true })
+            .eq("creator_id", id)
+            .eq("is_published", true);
+
+          // Take all their quizzes offline immediately
+          await supabase
+            .from("quizzes")
+            .update({ is_published: false })
+            .eq("creator_id", id);
+        }
+
+        // 2. Set is_suspended = true
+        const { error } = await supabase
+          .from("profiles")
+          .update({ is_suspended: true })
+          .eq("id", id);
+
+        if (error)
+          return res
+            .status(500)
+            .json({ error: "Failed to update suspension status" });
+
+        // 3. Force-invalidate all active sessions so the user is kicked out
+        //    immediately, not just blocked on their next protected API call.
+        try {
+          await supabase.auth.admin.signOut(id, "others");
+        } catch (signOutErr) {
+          // Non-fatal: authenticateRequest suspension check is the hard boundary.
+          console.warn(
+            "Session invalidation warning (non-fatal):",
+            signOutErr?.message ?? signOutErr,
+          );
+        }
+
+        return res.json({ ok: true, is_suspended: true });
+      } else {
+        // ── UNSUSPENDING ──────────────────────────────────────────────────────
+
+        // 1. Restore only quizzes that were live before suspension.
+        //    Quizzes the creator had already unpublished (was_published_before_suspension=false)
+        //    stay unpublished — we don't blindly re-publish everything.
+        if (targetProfile.is_approved_creator) {
+          await supabase
+            .from("quizzes")
+            .update({
+              is_published: true,
+              was_published_before_suspension: false,
+            })
+            .eq("creator_id", id)
+            .eq("was_published_before_suspension", true);
+
+          // Clear the snapshot flag on already-unpublished quizzes too
+          await supabase
+            .from("quizzes")
+            .update({ was_published_before_suspension: false })
+            .eq("creator_id", id)
+            .eq("was_published_before_suspension", false);
+        }
+
+        // 2. Clear suspension flag
+        const { error } = await supabase
+          .from("profiles")
+          .update({ is_suspended: false })
+          .eq("id", id);
+
+        if (error)
+          return res
+            .status(500)
+            .json({ error: "Failed to update suspension status" });
+
+        return res.json({ ok: true, is_suspended: false });
+      }
+    } catch (err) {
+      console.error("Admin suspend user error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 // POST /api/admin/quizzes/:id/unpublish — admin force-unpublish
-app.post("/api/admin/quizzes/:id/unpublish", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { error } = await supabase
-      .from("quizzes")
-      .update({ is_published: false, unpublished_by_admin: true })
-      .eq("id", id);
-    if (error) return res.status(500).json({ error: "Failed to unpublish quiz" });
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("Admin unpublish quiz error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+app.post(
+  "/api/admin/quizzes/:id/unpublish",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { error } = await supabase
+        .from("quizzes")
+        .update({ is_published: false, unpublished_by_admin: true })
+        .eq("id", id);
+      if (error)
+        return res.status(500).json({ error: "Failed to unpublish quiz" });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("Admin unpublish quiz error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 // POST /api/admin/quizzes/:id/republish — admin re-publish
-app.post("/api/admin/quizzes/:id/republish", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { error } = await supabase
-      .from("quizzes")
-      .update({ is_published: true, unpublished_by_admin: false })
-      .eq("id", id);
-    if (error) return res.status(500).json({ error: "Failed to republish quiz" });
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("Admin republish quiz error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+app.post(
+  "/api/admin/quizzes/:id/republish",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { error } = await supabase
+        .from("quizzes")
+        .update({ is_published: true, unpublished_by_admin: false })
+        .eq("id", id);
+      if (error)
+        return res.status(500).json({ error: "Failed to republish quiz" });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("Admin republish quiz error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 // POST /api/admin/reports/:id/resolve
-app.post("/api/admin/reports/:id/resolve", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { notes } = req.body;
-    const { error } = await supabase
-      .from("reports")
-      .update({
-        status: "resolved",
-        resolved_at: new Date().toISOString(),
-        details: notes || null,
-      })
-      .eq("id", id);
-    if (error) return res.status(500).json({ error: "Failed to resolve report" });
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("Admin resolve report error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+app.post(
+  "/api/admin/reports/:id/resolve",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { notes } = req.body;
+      const { error } = await supabase
+        .from("reports")
+        .update({
+          status: "resolved",
+          resolved_at: new Date().toISOString(),
+          details: notes || null,
+        })
+        .eq("id", id);
+      if (error)
+        return res.status(500).json({ error: "Failed to resolve report" });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("Admin resolve report error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 // POST /api/admin/reports/:id/dismiss
-app.post("/api/admin/reports/:id/dismiss", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { notes } = req.body;
-    const { error } = await supabase
-      .from("reports")
-      .update({
-        status: "dismissed",
-        resolved_at: new Date().toISOString(),
-        details: notes || null,
-      })
-      .eq("id", id);
-    if (error) return res.status(500).json({ error: "Failed to dismiss report" });
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("Admin dismiss report error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+app.post(
+  "/api/admin/reports/:id/dismiss",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { notes } = req.body;
+      const { error } = await supabase
+        .from("reports")
+        .update({
+          status: "dismissed",
+          resolved_at: new Date().toISOString(),
+          details: notes || null,
+        })
+        .eq("id", id);
+      if (error)
+        return res.status(500).json({ error: "Failed to dismiss report" });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("Admin dismiss report error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 // PUT /api/admin/courses/:id — update course metadata
-app.put("/api/admin/courses/:id", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { code, name, subject_area, level } = req.body;
-    const updates = {};
-    if (code !== undefined) updates.code = code;
-    if (name !== undefined) updates.name = name;
-    if (subject_area !== undefined) updates.subject_area = subject_area;
-    if (level !== undefined) updates.level = level;
+app.put(
+  "/api/admin/courses/:id",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { code, name, subject_area, level } = req.body;
+      const updates = {};
+      if (code !== undefined) updates.code = code;
+      if (name !== undefined) updates.name = name;
+      if (subject_area !== undefined) updates.subject_area = subject_area;
+      if (level !== undefined) updates.level = level;
 
-    const { data, error } = await supabase
-      .from("courses")
-      .update(updates)
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: "Failed to update course" });
-    return res.json({ course: data });
-  } catch (err) {
-    console.error("Admin update course error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+      const { data, error } = await supabase
+        .from("courses")
+        .update(updates)
+        .eq("id", id)
+        .select()
+        .single();
+      if (error)
+        return res.status(500).json({ error: "Failed to update course" });
+      return res.json({ course: data });
+    } catch (err) {
+      console.error("Admin update course error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 // POST /api/admin/universities — add university
-app.post("/api/admin/universities", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { name, abbreviation, state } = req.body;
-    if (!name || !abbreviation) {
-      return res.status(400).json({ error: "Name and abbreviation are required" });
+app.post(
+  "/api/admin/universities",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { name, abbreviation, state } = req.body;
+      if (!name || !abbreviation) {
+        return res
+          .status(400)
+          .json({ error: "Name and abbreviation are required" });
+      }
+      const uniId = `uni_${Date.now()}`;
+      const { data, error } = await supabase
+        .from("universities")
+        .insert({ id: uniId, name, abbreviation, state: state || null })
+        .select()
+        .single();
+      if (error)
+        return res
+          .status(500)
+          .json({ error: error.message || "Failed to add university" });
+      return res.json({ university: data });
+    } catch (err) {
+      console.error("Admin add university error:", err);
+      return res.status(500).json({ error: "Internal server error" });
     }
-    const uniId = `uni_${Date.now()}`;
-    const { data, error } = await supabase
-      .from("universities")
-      .insert({ id: uniId, name, abbreviation, state: state || null })
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: error.message || "Failed to add university" });
-    return res.json({ university: data });
-  } catch (err) {
-    console.error("Admin add university error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+  },
+);
 
 // PUT /api/admin/universities/:id — update university
-app.put("/api/admin/universities/:id", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, abbreviation, state } = req.body;
-    const updates = {};
-    if (name !== undefined) updates.name = name;
-    if (abbreviation !== undefined) updates.abbreviation = abbreviation;
-    if (state !== undefined) updates.state = state;
+app.put(
+  "/api/admin/universities/:id",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { name, abbreviation, state } = req.body;
+      const updates = {};
+      if (name !== undefined) updates.name = name;
+      if (abbreviation !== undefined) updates.abbreviation = abbreviation;
+      if (state !== undefined) updates.state = state;
 
-    const { data, error } = await supabase
-      .from("universities")
-      .update(updates)
-      .eq("id", id)
-      .select()
-      .single();
-    if (error) return res.status(500).json({ error: "Failed to update university" });
-    return res.json({ university: data });
-  } catch (err) {
-    console.error("Admin update university error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+      const { data, error } = await supabase
+        .from("universities")
+        .update(updates)
+        .eq("id", id)
+        .select()
+        .single();
+      if (error)
+        return res.status(500).json({ error: "Failed to update university" });
+      return res.json({ university: data });
+    } catch (err) {
+      console.error("Admin update university error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 // DELETE /api/admin/universities/:id — delete university (only if no deps)
-app.delete("/api/admin/universities/:id", authenticateRequest, requireAdmin, async (req, res) => {
-  try {
-    const { id } = req.params;
+app.delete(
+  "/api/admin/universities/:id",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
 
-    const [profilesRes, coursesRes, quizzesRes] = await Promise.all([
-      supabase.from("profiles").select("id", { count: "exact", head: true }).eq("university_id", id),
-      supabase.from("courses").select("id", { count: "exact", head: true }).eq("university_id", id),
-      supabase.from("quizzes").select("id", { count: "exact", head: true }).eq("university_id", id),
-    ]);
+      const [profilesRes, coursesRes, quizzesRes] = await Promise.all([
+        supabase
+          .from("profiles")
+          .select("id", { count: "exact", head: true })
+          .eq("university_id", id),
+        supabase
+          .from("courses")
+          .select("id", { count: "exact", head: true })
+          .eq("university_id", id),
+        supabase
+          .from("quizzes")
+          .select("id", { count: "exact", head: true })
+          .eq("university_id", id),
+      ]);
 
-    const deps = (profilesRes.count || 0) + (coursesRes.count || 0) + (quizzesRes.count || 0);
-    if (deps > 0) {
-      return res.status(409).json({
-        error: `Cannot delete: ${profilesRes.count || 0} users, ${coursesRes.count || 0} courses, and ${quizzesRes.count || 0} quizzes are linked to this university.`,
-      });
+      const deps =
+        (profilesRes.count || 0) +
+        (coursesRes.count || 0) +
+        (quizzesRes.count || 0);
+      if (deps > 0) {
+        return res.status(409).json({
+          error: `Cannot delete: ${profilesRes.count || 0} users, ${coursesRes.count || 0} courses, and ${quizzesRes.count || 0} quizzes are linked to this university.`,
+        });
+      }
+
+      const { error } = await supabase
+        .from("universities")
+        .delete()
+        .eq("id", id);
+      if (error)
+        return res.status(500).json({ error: "Failed to delete university" });
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("Admin delete university error:", err);
+      return res.status(500).json({ error: "Internal server error" });
     }
-
-    const { error } = await supabase.from("universities").delete().eq("id", id);
-    if (error) return res.status(500).json({ error: "Failed to delete university" });
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("Admin delete university error:", err);
-    return res.status(500).json({ error: "Internal server error" });
-  }
-});
+  },
+);
 
 app.post("/api/bank/resolve-account", authenticateRequest, async (req, res) => {
   try {
