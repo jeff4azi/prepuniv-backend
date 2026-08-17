@@ -1697,6 +1697,153 @@ app.post(
 );
 
 app.post(
+  "/api/admin/payout-requests/:id/mark-paid-manually",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id: payoutRequestId } = req.params;
+      const { reference } = req.body || {};
+
+      if (!reference || typeof reference !== "string" || !reference.trim()) {
+        return res.status(400).json({
+          error:
+            "Reference / proof of transfer is required — provide the bank transaction reference or other proof of manual payment.",
+        });
+      }
+      const rawReference = reference.trim();
+
+      // ── Atomic conditional lock: only eligible source states ──────────
+      const { data: locked, error: lockErr } = await supabase
+        .from("payout_requests")
+        .update({ status: "processing" })
+        .eq("id", payoutRequestId)
+        .in("status", ["pending", "failed", "reversed"])
+        .select()
+        .single();
+
+      if (lockErr || !locked) {
+        const { data: existingRow } = await supabase
+          .from("payout_requests")
+          .select("status")
+          .eq("id", payoutRequestId)
+          .maybeSingle();
+
+        if (!existingRow) {
+          return res.status(404).json({ error: "Payout request not found" });
+        }
+
+        if (existingRow.status === "paid") {
+          return res.json({
+            ok: true,
+            already_paid: true,
+            note: "This payout is already marked as paid.",
+          });
+        }
+
+        return res.status(409).json({
+          error: `Cannot mark as paid manually a payout with status '${existingRow.status}'. Manual confirmation is only allowed from pending, failed, or reversed states.`,
+        });
+      }
+
+      const payoutRequestIdFinal = locked.id;
+      const creatorId = locked.creator_id;
+      const payoutAmount = Number(locked.amount);
+      const walletTxnReference = `manual_${payoutRequestIdFinal}`;
+
+      try {
+        const { data: creator, error: creatorErr } = await supabase
+          .from("profiles")
+          .select("*")
+          .eq("id", creatorId)
+          .single();
+
+        if (creatorErr || !creator) {
+          await supabase
+            .from("payout_requests")
+            .update({
+              status: "failed",
+              failure_reason: "Creator profile not found during manual pay",
+            })
+            .eq("id", payoutRequestIdFinal);
+          return res.status(404).json({ error: "Creator profile not found" });
+        }
+
+        // ── Idempotent wallet_transactions insert ─────────────────────
+        const { error: existingTxnErr, data: existingTxn } = await supabase
+          .from("wallet_transactions")
+          .select("id")
+          .eq("reference", walletTxnReference)
+          .eq("type", "payout")
+          .maybeSingle();
+
+        if (existingTxnErr) {
+          throw existingTxnErr;
+        }
+
+        if (!existingTxn) {
+          const { error: txnInsertErr } = await supabase
+            .from("wallet_transactions")
+            .insert({
+              id: "wtx_" + crypto.randomUUID(),
+              user_id: creatorId,
+              amount: -payoutAmount,
+              type: "payout",
+              status: "completed",
+              reference: walletTxnReference,
+            });
+          if (txnInsertErr) throw txnInsertErr;
+        }
+
+        // ── Finalize payout_requests row ──────────────────────────────
+        const now = new Date().toISOString();
+        const { error: finalizeErr } = await supabase
+          .from("payout_requests")
+          .update({
+            status: "paid",
+            processed_at: now,
+            payment_method: "manual",
+            manual_reference: rawReference,
+            marked_paid_by: req.user.id,
+          })
+          .eq("id", payoutRequestIdFinal);
+        if (finalizeErr) throw finalizeErr;
+
+        return res.json({
+          ok: true,
+          status: "paid",
+          payout_request_id: payoutRequestIdFinal,
+          payment_method: "manual",
+          manual_reference: rawReference,
+          marked_paid_by: req.user.id,
+          wallet_reference: walletTxnReference,
+        });
+      } catch (innerErr) {
+        console.error("Manual payout finalize error:", innerErr);
+        try {
+          await supabase
+            .from("payout_requests")
+            .update({
+              status: "failed",
+              failure_reason:
+                innerErr instanceof Error
+                  ? innerErr.message
+                  : "Unexpected error during manual payout finalization",
+            })
+            .eq("id", payoutRequestIdFinal);
+        } catch (_rollbackErr) {
+          // swallow
+        }
+        return res.status(500).json({ error: "Internal server error" });
+      }
+    } catch (err) {
+      console.error("Manual payout outer error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+app.post(
   "/api/admin/creator-applications/:id/approve",
   authenticateRequest,
   requireAdmin,
