@@ -4,6 +4,7 @@ import cors from "cors";
 import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import axios from "axios";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 dotenv.config();
 
@@ -161,6 +162,25 @@ const flutterwaveAxios = axios.create({
   },
   timeout: 15000,
 });
+
+const fixieUrl = process.env.FIXIE_URL;
+const transferProxyAgent = fixieUrl ? new HttpsProxyAgent(fixieUrl) : undefined;
+
+const flutterwaveTransferAxios = axios.create({
+  baseURL: "https://api.flutterwave.com/v3",
+  headers: {
+    Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
+    "Content-Type": "application/json",
+  },
+  timeout: 15000,
+  ...(transferProxyAgent ? { httpsAgent: transferProxyAgent, proxy: false } : {}),
+});
+
+console.log(
+  fixieUrl
+    ? "Creator transfer calls routed via Fixie static IP"
+    : "Creator transfer calls using direct connection (no FIXIE_URL set — set this before re-enabling Flutterwave IP whitelisting)",
+);
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true });
@@ -328,7 +348,7 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
           );
           return res.status(200).json({ ok: true });
         }
-        const verifyResp = await flutterwaveAxios.get(
+        const verifyResp = await flutterwaveTransferAxios.get(
           `/transfers/${verifyId}`,
         );
         const verified = verifyResp.data?.data ?? verifyResp.data;
@@ -623,15 +643,7 @@ app.get("/api/banks", async (req, res) => {
     }
 
     try {
-      const response = await axios.get(
-        "https://api.flutterwave.com/v3/banks/NG",
-        {
-          headers: {
-            Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
-          },
-          timeout: 10000,
-        },
-      );
+      const response = await flutterwaveAxios.get("/banks/NG");
 
       if (
         response.data &&
@@ -702,20 +714,10 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
     }
 
     try {
-      const response = await axios.post(
-        "https://api.flutterwave.com/v3/accounts/resolve",
-        {
-          account_number: accountNumber,
-          account_bank: bankCode,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
-            "Content-Type": "application/json",
-          },
-          timeout: 12000,
-        },
-      );
+      const response = await flutterwaveAxios.post("/accounts/resolve", {
+        account_number: accountNumber,
+        account_bank: bankCode,
+      });
 
       if (
         response.data &&
@@ -1123,7 +1125,12 @@ app.get("/api/quiz/:id/analytics", authenticateRequest, async (req, res) => {
     if (!quiz) return res.status(404).json({ error: "Quiz not found" });
 
     // 2. Authorization check: must be owner or admin
-    const isAdmin = req.user.role === "admin";
+    const { data: profileRow } = await supabase
+      .from("profiles")
+      .select("role")
+      .eq("id", req.user.id)
+      .maybeSingle();
+    const isAdmin = profileRow?.role === "admin";
     if (quiz.creator_id !== req.user.id && !isAdmin) {
       return res
         .status(403)
@@ -1527,7 +1534,7 @@ async function _continuePayoutApprove(payoutRequest, res) {
     let synchronousFailure = null;
 
     try {
-      const transferResp = await flutterwaveAxios.post("/transfers", {
+      const transferResp = await flutterwaveTransferAxios.post("/transfers", {
         account_bank: bank_code,
         account_number,
         amount: Number(payoutRequest.amount),
