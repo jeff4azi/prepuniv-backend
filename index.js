@@ -7,10 +7,20 @@ import axios from "axios";
 
 dotenv.config();
 
-const CORS_ALLOWED_ORIGIN =
-  process.env.CORS_ALLOWED_ORIGIN || "https://prepuniv.vercel.app";
+const CORS_ALLOWED_ORIGIN = process.env.CORS_ALLOWED_ORIGIN;
+if (!CORS_ALLOWED_ORIGIN) {
+  console.error(
+    "FATAL: CORS_ALLOWED_ORIGIN is not configured. Set it explicitly in environment variables before starting the server.",
+  );
+  process.exit(1);
+}
 const FLUTTERWAVE_SECRET_KEY = process.env.FLUTTERWAVE_SECRET_KEY || "";
-const FLUTTERWAVE_WEBHOOK_SECRET = process.env.FLUTTERWAVE_WEBHOOK_SECRET || "";
+const FLUTTERWAVE_WEBHOOK_SECRET = process.env.FLUTTERWAVE_WEBHOOK_SECRET;
+if (!FLUTTERWAVE_WEBHOOK_SECRET) {
+  console.error(
+    "WARNING: FLUTTERWAVE_WEBHOOK_SECRET is not configured — webhook signature verification cannot proceed. Webhook calls will be rejected until this is set.",
+  );
+}
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const PORT = process.env.PORT || 5000;
@@ -76,8 +86,8 @@ const authenticateRequest = async (req, res, next) => {
     if (!error && data?.user) {
       req.user = data.user;
     } else {
-      // Fallback: decode JWT payload directly if getUser fails or for dev/test tokens
-      if (token) {
+      const AUTH_BYPASS_MODE = process.env.AUTH_BYPASS_MODE;
+      if (AUTH_BYPASS_MODE === "dev_only" && token) {
         try {
           const parts = token.split(".");
           if (parts.length === 3) {
@@ -85,6 +95,9 @@ const authenticateRequest = async (req, res, next) => {
               Buffer.from(parts[1], "base64").toString("utf8"),
             );
             if (payload && payload.sub) {
+              console.warn(
+                `[AUTH_BYPASS_MODE=dev_only] Accepting unverified JWT for sub=${payload.sub}. This MUST NOT be enabled in production.`,
+              );
               req.user = {
                 id: payload.sub,
                 email: payload.email || "user@prepuniv.com",
@@ -93,7 +106,7 @@ const authenticateRequest = async (req, res, next) => {
             }
           }
         } catch (jwtErr) {
-          console.warn("JWT fallback decode error:", jwtErr.message);
+          console.warn("AUTH_BYPASS_MODE decode error:", jwtErr.message);
         }
       }
 
@@ -200,9 +213,18 @@ app.post(
           },
         });
         payment_link = response.data?.data?.link;
+        if (!payment_link) {
+          throw new Error("Flutterwave response missing payment link");
+        }
       } catch (fwErr) {
         console.error("Flutterwave payment init failed:", fwErr.message);
-        payment_link = `${CORS_ALLOWED_ORIGIN}/wallet?tx_ref=${tx_ref}&mock_payment=1`;
+        await supabase
+          .from("wallet_transactions")
+          .update({ status: "failed" })
+          .eq("reference", tx_ref);
+        return res.status(502).json({
+          error: "Unable to start payment, please try again",
+        });
       }
 
       return res.json({ payment_link, tx_ref });
@@ -215,13 +237,20 @@ app.post(
 
 app.post("/api/webhooks/flutterwave", async (req, res) => {
   try {
+    if (!FLUTTERWAVE_WEBHOOK_SECRET) {
+      console.error(
+        "Webhook rejected: FLUTTERWAVE_WEBHOOK_SECRET is not configured — cannot verify webhook signatures.",
+      );
+      return res.status(500).json({
+        error:
+          "Webhook signature verification not configured. Set FLUTTERWAVE_WEBHOOK_SECRET.",
+      });
+    }
+
     const verifHash = req.headers["verif-hash"];
     const rawBody = req.rawBody ?? JSON.stringify(req.body);
     const expectedHash = crypto
-      .createHmac(
-        "sha256",
-        FLUTTERWAVE_WEBHOOK_SECRET || FLUTTERWAVE_SECRET_KEY,
-      )
+      .createHmac("sha256", FLUTTERWAVE_WEBHOOK_SECRET)
       .update(rawBody)
       .digest("hex");
 
@@ -570,26 +599,6 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
 });
 
 // ─── Nigerian Banks Data & Flutterwave Integration ────────────────────────────
-const STATIC_NIGERIAN_BANKS = [
-  { code: "044", name: "Access Bank" },
-  { code: "023", name: "Citibank Nigeria" },
-  { code: "050", name: "EcoBank Nigeria" },
-  { code: "070", name: "Fidelity Bank" },
-  { code: "011", name: "First Bank of Nigeria" },
-  { code: "214", name: "First City Monument Bank (FCMB)" },
-  { code: "058", name: "GTBank (Guaranty Trust)" },
-  { code: "030", name: "Heritage Bank" },
-  { code: "082", name: "Keystone Bank" },
-  { code: "999992", name: "OPay" },
-  { code: "50211", name: "Kuda Bank" },
-  { code: "076", name: "Polaris Bank" },
-  { code: "039", name: "Stanbic IBTC Bank" },
-  { code: "232", name: "Sterling Bank" },
-  { code: "033", name: "United Bank for Africa (UBA)" },
-  { code: "035", name: "Wema Bank" },
-  { code: "057", name: "Zenith Bank" },
-];
-
 let cachedBanksList = null;
 let cachedBanksListTime = 0;
 const BANK_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
@@ -606,48 +615,65 @@ app.get("/api/banks", async (req, res) => {
       });
     }
 
-    if (FLUTTERWAVE_SECRET_KEY) {
-      try {
-        const response = await axios.get(
-          "https://api.flutterwave.com/v3/banks/NG",
-          {
-            headers: {
-              Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
-            },
-            timeout: 10000,
-          },
-        );
-
-        if (
-          response.data &&
-          response.data.status === "success" &&
-          Array.isArray(response.data.data)
-        ) {
-          const banks = response.data.data.map((b) => ({
-            id: String(b.id || b.code),
-            code: String(b.code),
-            name: String(b.name),
-          }));
-          cachedBanksList = banks;
-          cachedBanksListTime = now;
-          return res.json({
-            status: "success",
-            data: banks,
-            source: "flutterwave",
-          });
-        }
-      } catch (flwErr) {
-        console.warn(
-          "Flutterwave fetch banks error, using static fallback:",
-          flwErr.message,
-        );
-      }
+    if (!FLUTTERWAVE_SECRET_KEY) {
+      console.error("Cannot fetch banks: FLUTTERWAVE_SECRET_KEY not configured");
+      return res
+        .status(503)
+        .json({ error: "Payment gateway not configured — cannot load banks" });
     }
 
-    return res.json({
-      status: "success",
-      data: STATIC_NIGERIAN_BANKS,
-      source: "static",
+    try {
+      const response = await axios.get(
+        "https://api.flutterwave.com/v3/banks/NG",
+        {
+          headers: {
+            Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
+          },
+          timeout: 10000,
+        },
+      );
+
+      if (
+        response.data &&
+        response.data.status === "success" &&
+        Array.isArray(response.data.data)
+      ) {
+        const banks = response.data.data.map((b) => ({
+          id: String(b.id || b.code),
+          code: String(b.code),
+          name: String(b.name),
+        }));
+        cachedBanksList = banks;
+        cachedBanksListTime = now;
+        return res.json({
+          status: "success",
+          data: banks,
+          source: "flutterwave",
+        });
+      }
+
+      console.warn("Flutterwave banks response invalid:", response.data);
+    } catch (flwErr) {
+      console.warn(
+        "Flutterwave fetch banks error — no valid cached data available:",
+        flwErr.message,
+      );
+    }
+
+    if (cachedBanksList) {
+      console.warn(
+        "Falling back to stale cached banks list (cache expired but live fetch failed)",
+      );
+      return res.json({
+        status: "success",
+        data: cachedBanksList,
+        source: "cache-stale",
+      });
+    }
+
+    return res.status(502).json({
+      error:
+        "Could not load banks from payment gateway. Please try again later.",
     });
   } catch (err) {
     console.error("Get banks error:", err);
@@ -666,128 +692,68 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
         .json({ error: "Invalid 10-digit account number or bank code" });
     }
 
-    if (FLUTTERWAVE_SECRET_KEY) {
-      // Resolve the correct Flutterwave bank code by fetching their bank list
-      let resolvedBankCode = bankCode;
-      try {
-        // Reuse the cached bank list or fetch fresh from Flutterwave
-        const now = Date.now();
-        if (!cachedBanksList || now - cachedBanksListTime >= BANK_CACHE_TTL) {
-          const banksResponse = await axios.get(
-            "https://api.flutterwave.com/v3/banks/NG",
-            {
-              headers: { Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}` },
-              timeout: 10000,
-            },
-          );
-          if (
-            banksResponse.data?.status === "success" &&
-            Array.isArray(banksResponse.data.data)
-          ) {
-            cachedBanksList = banksResponse.data.data.map((b) => ({
-              id: String(b.id || b.code),
-              code: String(b.code),
-              name: String(b.name),
-            }));
-            cachedBanksListTime = now;
-          }
-        }
-
-        // Look up the bank in the Flutterwave list to get the correct code
-        if (cachedBanksList && cachedBanksList.length > 0) {
-          // First try exact code match
-          const exactMatch = cachedBanksList.find((b) => b.code === bankCode);
-          if (exactMatch) {
-            resolvedBankCode = exactMatch.code;
-          } else {
-            // If code not found, try to match by name from our static list
-            const staticBank = STATIC_NIGERIAN_BANKS.find(
-              (b) => b.code === bankCode,
-            );
-            if (staticBank) {
-              const nameMatch = cachedBanksList.find(
-                (b) =>
-                  b.name
-                    .toLowerCase()
-                    .includes(staticBank.name.toLowerCase()) ||
-                  staticBank.name.toLowerCase().includes(b.name.toLowerCase()),
-              );
-              if (nameMatch) {
-                resolvedBankCode = nameMatch.code;
-                console.log(
-                  `Resolved static bank code ${bankCode} (${staticBank.name}) to Flutterwave code ${nameMatch.code} (${nameMatch.name})`,
-                );
-              }
-            }
-          }
-        }
-      } catch (bankListErr) {
-        console.warn(
-          "Could not fetch Flutterwave bank list for code resolution:",
-          bankListErr.message,
-        );
-        // Continue with the original code
-      }
-
-      try {
-        const response = await axios.post(
-          "https://api.flutterwave.com/v3/accounts/resolve",
-          {
-            account_number: accountNumber,
-            account_bank: resolvedBankCode,
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
-              "Content-Type": "application/json",
-            },
-            timeout: 12000,
-          },
-        );
-
-        if (
-          response.data &&
-          (response.data.status === "success" ||
-            response.data.data?.account_name)
-        ) {
-          const accountName = response.data.data?.account_name || "";
-          if (accountName) {
-            return res.json({
-              success: true,
-              accountName: accountName.toUpperCase(),
-              accountNumber,
-              bankCode,
-            });
-          }
-        }
-      } catch (flwErr) {
-        console.warn(
-          "Flutterwave resolve error:",
-          flwErr.response?.data || flwErr.message,
-        );
-        const rawMsg = flwErr.response?.data?.message || "";
-        // Provide a user-friendly error instead of exposing Flutterwave internals
-        const errMsg =
-          rawMsg.includes("destbankcode") || rawMsg.includes("account_bank")
-            ? "This bank is not currently supported for account verification. Please try a different bank or contact support."
-            : rawMsg ||
-              "Could not verify account — please check account number and bank selected.";
-        return res.status(400).json({ error: errMsg });
-      }
+    if (!FLUTTERWAVE_SECRET_KEY) {
+      console.error(
+        "Bank resolve rejected: FLUTTERWAVE_SECRET_KEY not configured",
+      );
+      return res
+        .status(503)
+        .json({ error: "Payment gateway not configured — cannot verify account" });
     }
 
-    // Mock fallback when FLW key is not set or in offline demo mode
-    const mockName =
-      req.user.user_metadata?.full_name?.toUpperCase() ||
-      req.user.email?.split("@")[0]?.toUpperCase() ||
-      "ACCOUNT HOLDER";
+    try {
+      const response = await axios.post(
+        "https://api.flutterwave.com/v3/accounts/resolve",
+        {
+          account_number: accountNumber,
+          account_bank: bankCode,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${FLUTTERWAVE_SECRET_KEY}`,
+            "Content-Type": "application/json",
+          },
+          timeout: 12000,
+        },
+      );
 
-    return res.json({
-      success: true,
-      accountName: mockName,
-      accountNumber,
-      bankCode,
-    });
+      if (
+        response.data &&
+        (response.data.status === "success" ||
+          response.data.data?.account_name)
+      ) {
+        const accountName = response.data.data?.account_name || "";
+        if (accountName) {
+          return res.json({
+            success: true,
+            accountName: accountName.toUpperCase(),
+            accountNumber,
+            bankCode,
+          });
+        }
+      }
+
+      console.warn(
+        "Flutterwave resolve returned no account_name:",
+        response.data,
+      );
+      return res.status(400).json({
+        error:
+          "Could not verify account — please check account number and bank selected.",
+      });
+    } catch (flwErr) {
+      console.warn(
+        "Flutterwave resolve error:",
+        flwErr.response?.data || flwErr.message,
+      );
+      const rawMsg = flwErr.response?.data?.message || "";
+      const errMsg =
+        rawMsg.includes("destbankcode") || rawMsg.includes("account_bank")
+          ? "This bank is not currently supported for account verification. Please try a different bank or contact support."
+          : rawMsg ||
+            "Could not verify account — please check account number and bank selected.";
+      return res.status(400).json({ error: errMsg });
+    }
   } catch (err) {
     console.error("Resolve bank error:", err);
     return res
@@ -1683,19 +1649,36 @@ app.post(
       const { id: payoutRequestId } = req.params;
       const { notes } = req.body;
 
-      const { error } = await supabase
+      const { data: rejected, error: rejectErr } = await supabase
         .from("payout_requests")
         .update({
           status: "rejected",
           processed_at: new Date().toISOString(),
           notes: notes || null,
         })
-        .eq("id", payoutRequestId);
+        .eq("id", payoutRequestId)
+        .in("status", ["pending", "failed", "reversed"])
+        .select()
+        .single();
 
-      if (error) {
-        return res
-          .status(500)
-          .json({ error: "Failed to reject payout request" });
+      if (rejectErr || !rejected) {
+        const { data: existingRow } = await supabase
+          .from("payout_requests")
+          .select("status")
+          .eq("id", payoutRequestId)
+          .maybeSingle();
+
+        if (!existingRow) {
+          return res.status(404).json({ error: "Payout request not found" });
+        }
+
+        if (existingRow.status === "rejected") {
+          return res.json({ ok: true, already_rejected: true });
+        }
+
+        return res.status(409).json({
+          error: `Cannot reject a payout with status '${existingRow.status}'. Rejection is only allowed from pending, failed, or reversed states.`,
+        });
       }
 
       return res.json({ ok: true });
@@ -1718,19 +1701,43 @@ app.post(
         .from("creator_applications")
         .select("*")
         .eq("id", applicationId)
-        .single();
+        .maybeSingle();
 
       if (appErr || !application) {
         return res.status(404).json({ error: "Creator application not found" });
       }
 
-      await supabase
+      if (application.status === "approved") {
+        return res.json({ ok: true, already_approved: true });
+      }
+      if (application.status === "rejected") {
+        return res.status(409).json({
+          error: "Cannot approve an application that has already been rejected",
+        });
+      }
+
+      const { error: updateErr } = await supabase
         .from("creator_applications")
         .update({
           status: "approved",
           processed_at: new Date().toISOString(),
         })
-        .eq("id", applicationId);
+        .eq("id", applicationId)
+        .eq("status", "pending");
+
+      if (updateErr) {
+        const { data: recheck } = await supabase
+          .from("creator_applications")
+          .select("status")
+          .eq("id", applicationId)
+          .maybeSingle();
+        if (recheck?.status === "approved") {
+          return res.json({ ok: true, already_approved: true });
+        }
+        return res.status(409).json({
+          error: `Creator application has status '${recheck?.status}' and cannot be approved`,
+        });
+      }
 
       const { data: currentProfile } = await supabase
         .from("profiles")
@@ -1767,19 +1774,47 @@ app.post(
       const { id: applicationId } = req.params;
       const { notes } = req.body;
 
-      const { error } = await supabase
+      const { data: application, error: appErr } = await supabase
+        .from("creator_applications")
+        .select("status")
+        .eq("id", applicationId)
+        .maybeSingle();
+
+      if (appErr || !application) {
+        return res.status(404).json({ error: "Creator application not found" });
+      }
+
+      if (application.status === "rejected") {
+        return res.json({ ok: true, already_rejected: true });
+      }
+      if (application.status === "approved") {
+        return res.status(409).json({
+          error: "Cannot reject an application that has already been approved",
+        });
+      }
+
+      const { error: updateErr } = await supabase
         .from("creator_applications")
         .update({
           status: "rejected",
           processed_at: new Date().toISOString(),
           notes: notes || null,
         })
-        .eq("id", applicationId);
+        .eq("id", applicationId)
+        .eq("status", "pending");
 
-      if (error) {
-        return res
-          .status(500)
-          .json({ error: "Failed to reject creator application" });
+      if (updateErr) {
+        const { data: recheck } = await supabase
+          .from("creator_applications")
+          .select("status")
+          .eq("id", applicationId)
+          .maybeSingle();
+        if (recheck?.status === "rejected") {
+          return res.json({ ok: true, already_rejected: true });
+        }
+        return res.status(409).json({
+          error: `Creator application has status '${recheck?.status}' and cannot be rejected`,
+        });
       }
 
       return res.json({ ok: true });
@@ -2141,7 +2176,7 @@ app.post(
           .status(400)
           .json({ error: "Name and abbreviation are required" });
       }
-      const uniId = `uni_${Date.now()}`;
+      const uniId = "uni_" + crypto.randomUUID();
       const { data, error } = await supabase
         .from("universities")
         .insert({ id: uniId, name, abbreviation, state: state || null })
@@ -2236,42 +2271,6 @@ app.delete(
     }
   },
 );
-
-app.post("/api/bank/resolve-account", authenticateRequest, async (req, res) => {
-  try {
-    const { account_number, bank_code } = req.body;
-
-    if (!account_number || !bank_code) {
-      return res
-        .status(400)
-        .json({ error: "account_number and bank_code are required" });
-    }
-
-    const response = await flutterwaveAxios.post("/accounts/resolve", {
-      account_number,
-      account_bank: bank_code,
-    });
-
-    return res.json(response.data?.data || response.data);
-  } catch (err) {
-    console.error("Resolve account error:", err);
-    const status = err.response?.status || 500;
-    const message = err.response?.data?.message || err.message;
-    return res.status(status).json({ error: message });
-  }
-});
-
-app.get("/api/banks", authenticateRequest, async (req, res) => {
-  try {
-    const response = await flutterwaveAxios.get("/banks/NG", {
-      params: { country: "NG" },
-    });
-    return res.json(response.data?.data || []);
-  } catch (err) {
-    console.error("Get banks error:", err.message);
-    return res.json([]);
-  }
-});
 
 // app.listen is only used in local development.
 // On Vercel (serverless), the exported app is used directly as the handler.
