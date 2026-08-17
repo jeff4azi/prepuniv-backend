@@ -234,6 +234,187 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
     }
 
     const body = req.body;
+    const eventType = body?.event;
+
+    // ─── Transfer webhook handling (payouts) ──────────────────────────────
+    if (eventType === "transfer.completed" || eventType === "transfer.failed") {
+      const webhookTransferId = body?.data?.id;
+      const webhookReference = body?.data?.reference;
+      const webhookStatus = body?.data?.status;
+
+      if (!webhookTransferId && !webhookReference) {
+        console.warn("Transfer webhook missing both id and reference — ignoring");
+        return res.status(200).json({ ok: true });
+      }
+
+      // 1. Look up the payout_requests row
+      let payoutLookup;
+      if (webhookTransferId) {
+        payoutLookup = await supabase
+          .from("payout_requests")
+          .select("*")
+          .eq("flutterwave_transfer_id", String(webhookTransferId))
+          .maybeSingle();
+      }
+      if ((!payoutLookup || !payoutLookup.data) && webhookReference) {
+        payoutLookup = await supabase
+          .from("payout_requests")
+          .select("*")
+          .eq("flutterwave_reference", webhookReference)
+          .maybeSingle();
+      }
+
+      const payout = payoutLookup?.data;
+      if (!payout) {
+        console.warn("Transfer webhook: no payout_requests row found", {
+          transfer_id: webhookTransferId,
+          reference: webhookReference,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 2. Idempotency guard — if already resolved, do nothing
+      if (payout.status === "paid" || payout.status === "failed") {
+        console.log(
+          `Transfer webhook idempotency: payout ${payout.id} already at ${payout.status}, ignoring`,
+        );
+        return res.status(200).json({ ok: true });
+      }
+
+      // 3. NEVER trust the webhook status alone — re-verify against the API
+      let verifiedStatus = null;
+      let verifiedFailureMsg = null;
+      try {
+        if (!FLUTTERWAVE_SECRET_KEY) {
+          console.error(
+            "FLUTTERWAVE_SECRET_KEY missing — cannot verify transfer webhook",
+          );
+          return res.status(500).json({ ok: false });
+        }
+        const verifyId = webhookTransferId || payout.flutterwave_transfer_id;
+        if (!verifyId) {
+          console.error(
+            "No transfer id available to verify payout webhook",
+            payout.id,
+          );
+          return res.status(200).json({ ok: true });
+        }
+        const verifyResp = await flutterwaveAxios.get(
+          `/transfers/${verifyId}`,
+        );
+        const verified = verifyResp.data?.data ?? verifyResp.data;
+        verifiedStatus = verified?.status;
+        verifiedFailureMsg =
+          verified?.complete_message || verified?.fail_message || null;
+      } catch (verifyErr) {
+        console.error(
+          `Transfer webhook verify API call failed for payout ${payout.id}:`,
+          verifyErr.message,
+        );
+        // Leave at processing — never auto-resolve on verify failure
+        return res.status(200).json({ ok: true });
+      }
+
+      // 4. Act on the VERIFIED status (never the webhook payload's status)
+      const statusUpper = String(verifiedStatus || "").toUpperCase();
+
+      if (statusUpper === "SUCCESSFUL") {
+        // ── Transfer completed successfully — FINALIZE payout ──
+        const now = new Date().toISOString();
+
+        // Only insert wallet_transactions row HERE, once, idempotently
+        const { error: existingPayoutTxErr } = await supabase
+          .from("wallet_transactions")
+          .select("id")
+          .eq("reference", payout.flutterwave_reference || String(payout.id))
+          .eq("type", "payout")
+          .maybeSingle();
+
+        if (!existingPayoutTxErr && !existingPayoutTxErr?.data) {
+          await supabase.from("wallet_transactions").insert({
+            id: "wtx_" + crypto.randomUUID(),
+            user_id: payout.creator_id,
+            amount: -Number(payout.amount),
+            type: "payout",
+            status: "completed",
+            reference: payout.flutterwave_reference || String(payout.id),
+          });
+        }
+
+        const { error: updErr } = await supabase
+          .from("payout_requests")
+          .update({
+            status: "paid",
+            processed_at: now,
+            failure_reason: null,
+          })
+          .eq("id", payout.id);
+
+        if (updErr) console.error("Payout paid update error:", updErr);
+        console.log(`Payout ${payout.id} marked as PAID via transfer webhook`);
+      } else if (
+        statusUpper === "FAILED" ||
+        statusUpper === "REVERSED"
+      ) {
+        if (statusUpper === "FAILED") {
+          await supabase
+            .from("payout_requests")
+            .update({
+              status: "failed",
+              failure_reason: verifiedFailureMsg || "Transfer failed",
+            })
+            .eq("id", payout.id);
+          console.log(
+            `Payout ${payout.id} marked as FAILED via transfer webhook`,
+          );
+        } else {
+          // REVERSED — payout was previously paid but the bank reversed it
+          // 1. Insert a compensating positive wallet_transactions (reversal)
+          //    but only once — idempotency via unique reference
+          const reversalRef = `reversal_${payout.flutterwave_reference || payout.id}`;
+          const { data: existingReversal } = await supabase
+            .from("wallet_transactions")
+            .select("id")
+            .eq("reference", reversalRef)
+            .maybeSingle();
+
+          if (!existingReversal) {
+            await supabase.from("wallet_transactions").insert({
+              id: "wtx_" + crypto.randomUUID(),
+              user_id: payout.creator_id,
+              amount: Number(payout.amount),
+              type: "reversal",
+              status: "completed",
+              reference: reversalRef,
+            });
+          }
+
+          await supabase
+            .from("payout_requests")
+            .update({
+              status: "reversed",
+              failure_reason:
+                verifiedFailureMsg ||
+                "Transfer was reversed by the bank after initial success",
+            })
+            .eq("id", payout.id);
+
+          console.log(
+            `Payout ${payout.id} marked as REVERSED via transfer webhook — balance restored`,
+          );
+        }
+      } else {
+        // Any unknown status — log but leave at processing
+        // "Unknown" must never mean "success"
+        console.log(
+          `Transfer webhook: payout ${payout.id} has unrecognized verified status ${verifiedStatus}, leaving at 'processing' for manual review`,
+        );
+      }
+
+      return res.status(200).json({ ok: true });
+    }
+
+    // ─── Topup webhook handling (existing logic) ──────────────────────────
     const tx_ref = body?.data?.tx_ref ?? body?.tx_ref;
     const transaction_id = body?.data?.id ?? body?.transaction_id;
 
@@ -1102,7 +1283,7 @@ app.post(
         .from("payout_requests")
         .select("requested_at")
         .eq("creator_id", req.user.id)
-        .in("status", ["approved", "paid", "pending"])
+        .in("status", ["pending", "processing", "paid"])
         .order("requested_at", { ascending: false })
         .limit(1)
         .maybeSingle();
@@ -1151,6 +1332,8 @@ app.post(
   },
 );
 
+
+/* Transfer to creators endpoint */
 app.post(
   "/api/admin/payout-requests/:id/approve",
   authenticateRequest,
@@ -1159,167 +1342,337 @@ app.post(
     try {
       const { id: payoutRequestId } = req.params;
 
-      const { data: payoutRequest, error: prErr } = await supabase
+      // ====================================================================
+      // PART 2 — ATOMIC STATE TRANSITION (prevents double-payment)
+      // The very first thing we do: try to atomically flip pending→processing.
+      // The eq('status', 'pending') guard means only ONE concurrent caller
+      // will ever match — all others get zero rows and bail out with 409.
+      // ====================================================================
+      const { data: locked, error: lockErr } = await supabase
         .from("payout_requests")
-        .select("*")
+        .update({ status: "processing" })
         .eq("id", payoutRequestId)
+        .eq("status", "pending")
+        .select()
         .single();
 
-      if (prErr || !payoutRequest) {
-        return res.status(404).json({ error: "Payout request not found" });
-      }
-
-      if (payoutRequest.status !== "pending") {
-        return res
-          .status(400)
-          .json({ error: "Only pending requests can be approved" });
-      }
-
-      const { error: updateErr } = await supabase
-        .from("payout_requests")
-        .update({
-          status: "approved",
-          processed_at: new Date().toISOString(),
-        })
-        .eq("id", payoutRequestId);
-
-      if (updateErr) {
-        return res
-          .status(500)
-          .json({ error: "Failed to update payout request" });
-      }
-
-      const { data: creator, error: creatorErr } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("id", payoutRequest.creator_id)
-        .single();
-
-      if (creatorErr || !creator) {
-        return res.status(404).json({ error: "Creator profile not found" });
-      }
-
-      const bank_code = payoutRequest.bank_code || creator.bank_code;
-      const account_number =
-        payoutRequest.bank_account_number || creator.bank_account_number;
-      const bank_account_name = creator.bank_account_name || creator.full_name;
-
-      if (!bank_code || !account_number) {
-        const failNote = "Missing bank details for creator";
-        await supabase.from("wallet_transactions").insert({
-          id: "wtx_" + crypto.randomUUID(),
-          user_id: creator.id,
-          amount: 0,
-          type: "payout",
-          status: "failed",
-          reference: String(payoutRequestId),
-        });
-        await supabase
+      if (lockErr || !locked) {
+        // Either the row didn't exist at all, or it wasn't pending.
+        // Distinguish the two cases for a clear error.
+        const { data: existingRow } = await supabase
           .from("payout_requests")
-          .update({ status: "failed", notes: failNote })
-          .eq("id", payoutRequestId);
-        return res.status(400).json({ error: failNote });
-      }
+          .select("status")
+          .eq("id", payoutRequestId)
+          .maybeSingle();
 
-      const transferRef = "payout_" + crypto.randomUUID();
-      let transferSuccess = false;
-      let transferMessage = "";
-
-      try {
-        const transferResp = await flutterwaveAxios.post("/transfers", {
-          account_bank: bank_code,
-          account_number,
-          amount: payoutRequest.amount,
-          currency: "NGN",
-          narration: "PrepUniv payout",
-          reference: transferRef,
-          beneficiary_name: bank_account_name,
-        });
-
-        const transferStatus = transferResp.data?.data?.status;
-
-        let verifiedStatus = transferStatus;
-        try {
-          const verifyResp = await flutterwaveAxios.get(
-            `/transfers/${transferRef}`,
-          );
-          verifiedStatus = verifyResp.data?.data?.status || transferStatus;
-          transferMessage =
-            verifyResp.data?.message || transferResp.data?.message || "";
-        } catch (vErr) {
-          transferMessage = vErr.message;
+        if (!existingRow) {
+          return res.status(404).json({ error: "Payout request not found" });
         }
 
         if (
-          verifiedStatus === "SUCCESSFUL" ||
-          verifiedStatus === "successful" ||
-          verifiedStatus === "NEW"
+          existingRow.status === "failed" ||
+          existingRow.status === "reversed"
         ) {
-          transferSuccess = true;
-        } else if (verifiedStatus === "FAILED" || verifiedStatus === "failed") {
-          transferSuccess = false;
-          transferMessage = transferMessage || "Transfer failed";
-        } else {
-          transferSuccess = false;
-          transferMessage = `Transfer in status: ${verifiedStatus}`;
+          // Retry case: a previously-failed/reversed payout is being retried.
+          // Atomically flip it back to processing to lock this attempt.
+          const { data: relocked, error: relockErr } = await supabase
+            .from("payout_requests")
+            .update({ status: "processing" })
+            .eq("id", payoutRequestId)
+            .in("status", ["failed", "reversed"])
+            .select()
+            .single();
+
+          if (relockErr || !relocked) {
+            return res.status(409).json({
+              error:
+                "This payout has already been processed or is being processed",
+            });
+          }
+          // relock succeeded — continue with relocked as our locked row
+          return await _continuePayoutApprove(relocked, res);
         }
-      } catch (fwErr) {
-        transferSuccess = false;
-        transferMessage = fwErr.response?.data?.message || fwErr.message;
-      }
 
-      if (transferSuccess) {
-        await supabase.from("wallet_transactions").insert({
-          id: "wtx_" + crypto.randomUUID(),
-          user_id: creator.id,
-          amount: -payoutRequest.amount,
-          type: "payout",
-          status: "completed",
-          reference: String(payoutRequestId),
-        });
-
-        await supabase
-          .from("payout_requests")
-          .update({ status: "paid" })
-          .eq("id", payoutRequestId);
-
-        return res.json({
-          ok: true,
-          status: "paid",
-          payout_request_id: payoutRequestId,
-          transfer_reference: transferRef,
-        });
-      } else {
-        await supabase.from("wallet_transactions").insert({
-          id: "wtx_" + crypto.randomUUID(),
-          user_id: creator.id,
-          amount: 0,
-          type: "payout",
-          status: "failed",
-          reference: String(payoutRequestId),
-        });
-
-        await supabase
-          .from("payout_requests")
-          .update({
-            status: "failed",
-            notes: transferMessage || "Transfer failed",
-          })
-          .eq("id", payoutRequestId);
-
-        return res.json({
-          ok: true,
-          status: "failed",
-          payout_request_id: payoutRequestId,
-          message: transferMessage,
+        // Any other status (processing / paid / rejected): already in flight or final
+        return res.status(409).json({
+          error:
+            "This payout has already been processed or is being processed",
         });
       }
+
+      // Lock succeeded — continue with the rest of the flow.
+      return await _continuePayoutApprove(locked, res);
     } catch (err) {
-      console.error("Payout approve error:", err);
+      console.error("Payout approve outer error:", err);
       return res.status(500).json({ error: "Internal server error" });
     }
   },
 );
+
+// Extracted helper — the post-lock body of the approve flow.
+// Shared between the initial approve path and the retry-from-failed path.
+async function _continuePayoutApprove(payoutRequest, res) {
+  const payoutRequestId = payoutRequest.id;
+
+  try {
+    // ====================================================================
+    // Fetch creator profile once.
+    // ====================================================================
+    const { data: creator, error: creatorErr } = await supabase
+      .from("profiles")
+      .select("*")
+      .eq("id", payoutRequest.creator_id)
+      .single();
+
+    if (creatorErr || !creator) {
+      await supabase
+        .from("payout_requests")
+        .update({
+          status: "failed",
+          failure_reason: "Creator profile not found",
+        })
+        .eq("id", payoutRequestId);
+      return res.status(404).json({ error: "Creator profile not found" });
+    }
+
+    // ====================================================================
+    // Resolve bank details.
+    // ====================================================================
+    const bank_code = payoutRequest.bank_code || creator.bank_code;
+    const account_number =
+      payoutRequest.bank_account_number || creator.bank_account_number;
+
+    if (!bank_code || !account_number) {
+      const failMsg = "Missing bank details for creator";
+      await supabase
+        .from("payout_requests")
+        .update({
+          status: "failed",
+          failure_reason: failMsg,
+        })
+        .eq("id", payoutRequestId);
+      return res.status(400).json({ error: failMsg });
+    }
+
+    // ====================================================================
+    // PART 5 — VERIFIED BANK ACCOUNT NAME ONLY (no full_name fallback)
+    // The whole point of the bank-verify setup flow was to capture the
+    // Flutterwave-resolved account holder name. If it's not present, HARD
+    // FAIL — never fall back to an unverified user-entered name.
+    // ====================================================================
+    const bank_account_name = creator.bank_account_name;
+    if (!bank_account_name || !bank_account_name.trim()) {
+      const failMsg =
+        "Creator's bank account is not verified — they must complete the bank verification flow before payouts can be sent.";
+      await supabase
+        .from("payout_requests")
+        .update({
+          status: "failed",
+          failure_reason: failMsg,
+        })
+        .eq("id", payoutRequestId);
+      return res.status(400).json({ error: failMsg });
+    }
+
+    // ====================================================================
+    // PART 3 — STABLE, IDEMPOTENT TRANSFER REFERENCE
+    // Check if this payout request already has a reference (retry path).
+    // If yes, reuse it. If no, generate one and PERSIST IT NOW, BEFORE
+    // calling Flutterwave, so a crash between generating and calling
+    // doesn't cause a second reference on retry.
+    // ====================================================================
+    let transferRef = payoutRequest.flutterwave_reference;
+    if (!transferRef) {
+      transferRef = "payout_" + crypto.randomUUID();
+      const { error: refErr } = await supabase
+        .from("payout_requests")
+        .update({ flutterwave_reference: transferRef })
+        .eq("id", payoutRequestId);
+      if (refErr) {
+        console.error("Failed to persist flutterwave_reference:", refErr);
+        await supabase
+          .from("payout_requests")
+          .update({
+            status: "failed",
+            failure_reason: "Internal error preparing transfer reference",
+          })
+          .eq("id", payoutRequestId);
+        return res
+          .status(500)
+          .json({ error: "Internal error preparing payout" });
+      }
+    }
+
+    // ====================================================================
+    // PART 8 — NO SILENT DEMO MODE
+    // Missing key = hard 500 with server log.
+    // Only explicit PAYOUT_MODE=demo is accepted as a deliberate local-dev
+    // simulation, and it logs clearly so it can never be mistaken for real.
+    // ====================================================================
+    const PAYOUT_MODE = process.env.PAYOUT_MODE || "live";
+    if (!FLUTTERWAVE_SECRET_KEY && PAYOUT_MODE !== "demo") {
+      const errMsg =
+        "FLUTTERWAVE_SECRET_KEY not configured — payouts cannot be processed. Set PAYOUT_MODE=demo only for local development simulation.";
+      console.error(errMsg);
+      await supabase
+        .from("payout_requests")
+        .update({
+          status: "failed",
+          failure_reason: "Payment gateway not configured",
+        })
+        .eq("id", payoutRequestId);
+      return res.status(500).json({ error: "Payment gateway not configured" });
+    }
+
+    // ====================================================================
+    // EXPLICIT DEMO MODE (only when PAYOUT_MODE=demo is set)
+    // Visibly labeled, never inferred from a missing key.
+    // ====================================================================
+    if (PAYOUT_MODE === "demo") {
+      console.warn(
+        `[DEMO MODE] Payout ${payoutRequestId} — simulating processing for transfer_ref=${transferRef}. No real money moved.`,
+      );
+      await supabase
+        .from("payout_requests")
+        .update({
+          status: "processing",
+          flutterwave_reference: transferRef,
+        })
+        .eq("id", payoutRequestId);
+      return res.json({
+        ok: true,
+        status: "processing",
+        payout_request_id: payoutRequestId,
+        transfer_reference: transferRef,
+        demo_mode: true,
+        note:
+          "DEMO MODE: transfer not actually sent. Set PAYOUT_MODE=live and provide FLUTTERWAVE_SECRET_KEY for real payouts.",
+      });
+    }
+
+    // ====================================================================
+    // PART 4 — CORRECT FLUTTERWAVE V3 TRANSFER PAYLOAD
+    // The v3 /transfers payload does NOT include beneficiary_name.
+    // Standard v3 shape: account_bank, account_number, amount,
+    // currency, narration, reference, debit_currency.
+    // Reference is our stable, persisted idempotency key.
+    // ====================================================================
+    let fwTransferId = null;
+    let synchronousFailure = null;
+
+    try {
+      const transferResp = await flutterwaveAxios.post("/transfers", {
+        account_bank: bank_code,
+        account_number,
+        amount: Number(payoutRequest.amount),
+        currency: "NGN",
+        narration: "PrepUniv creator payout",
+        reference: transferRef,
+        debit_currency: "NGN",
+      });
+
+      const transferData = transferResp.data?.data;
+      fwTransferId = transferData?.id ? String(transferData.id) : null;
+      const transferStatus = transferData?.status
+        ? String(transferData.status).toUpperCase()
+        : null;
+
+      // If Flutterwave returned a synchronous FAILED status (rare but possible),
+      // record it immediately as a failure.
+      if (transferStatus === "FAILED") {
+        synchronousFailure =
+          transferData?.complete_message ||
+          transferData?.fail_message ||
+          "Transfer rejected synchronously by Flutterwave/bank";
+      }
+      // Any other 2xx response with an ID means the transfer was ACCEPTED
+      // and is now in flight (NEW / PENDING / QUEUED etc). We do NOT treat
+      // any of these as "paid" — only the webhook, after re-verification,
+      // can flip to paid/failed/reversed.
+    } catch (fwErr) {
+      // A genuine synchronous rejection (network-level or real API error
+      // with an error response that isn't a queued status).
+      synchronousFailure =
+        fwErr.response?.data?.message ||
+        fwErr.response?.data?.error ||
+        fwErr.message ||
+        "Transfer request failed";
+      console.error(
+        "Flutterwave transfer synchronous error:",
+        fwErr.response?.data || fwErr.message,
+      );
+    }
+
+    // ====================================================================
+    // PART 6 — CORRECT RESPONSE HANDLING: PROCESSING IS NOT PAID
+    //
+    // Accepted (got a transfer id, no sync failure):
+    //   - status = 'processing'
+    //   - store flutterwave_transfer_id
+    //   - NO wallet_transactions row yet
+    //   - NO status='paid'
+    //   - Return { status: 'processing' } to admin UI
+    //
+    // Synchronous hard failure:
+    //   - status = 'failed'
+    //   - failure_reason populated
+    //   - NO wallet_transactions row
+    // ====================================================================
+    if (synchronousFailure) {
+      await supabase
+        .from("payout_requests")
+        .update({
+          status: "failed",
+          failure_reason: synchronousFailure,
+        })
+        .eq("id", payoutRequestId);
+
+      return res.json({
+        ok: true,
+        status: "failed",
+        payout_request_id: payoutRequestId,
+        transfer_reference: transferRef,
+        message: synchronousFailure,
+      });
+    }
+
+    // Transfer accepted and in flight — persist the transfer id.
+    const updateFields = {
+      status: "processing",
+      flutterwave_transfer_id: fwTransferId,
+    };
+    await supabase
+      .from("payout_requests")
+      .update(updateFields)
+      .eq("id", payoutRequestId);
+
+    return res.json({
+      ok: true,
+      status: "processing",
+      payout_request_id: payoutRequestId,
+      transfer_reference: transferRef,
+      flutterwave_transfer_id: fwTransferId,
+    });
+  } catch (innerErr) {
+    console.error("Payout approve inner flow error:", innerErr);
+    // Best-effort: mark as failed so we don't leave a stuck processing row
+    try {
+      await supabase
+        .from("payout_requests")
+        .update({
+          status: "failed",
+          failure_reason:
+            innerErr instanceof Error
+              ? innerErr.message
+              : "Unexpected error during payout initiation",
+        })
+        .eq("id", payoutRequestId);
+    } catch (_rollbackErr) {
+      // swallow — we already have the error logged
+    }
+    return res.status(500).json({ error: "Internal server error" });
+  }
+}
 
 app.post(
   "/api/admin/payout-requests/:id/reject",
