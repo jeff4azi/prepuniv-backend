@@ -173,7 +173,9 @@ const flutterwaveTransferAxios = axios.create({
     "Content-Type": "application/json",
   },
   timeout: 15000,
-  ...(transferProxyAgent ? { httpsAgent: transferProxyAgent, proxy: false } : {}),
+  ...(transferProxyAgent
+    ? { httpsAgent: transferProxyAgent, proxy: false }
+    : {}),
 });
 
 console.log(
@@ -292,7 +294,9 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
       const webhookStatus = body?.data?.status;
 
       if (!webhookTransferId && !webhookReference) {
-        console.warn("Transfer webhook missing both id and reference — ignoring");
+        console.warn(
+          "Transfer webhook missing both id and reference — ignoring",
+        );
         return res.status(200).json({ ok: true });
       }
 
@@ -401,10 +405,7 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
 
         if (updErr) console.error("Payout paid update error:", updErr);
         console.log(`Payout ${payout.id} marked as PAID via transfer webhook`);
-      } else if (
-        statusUpper === "FAILED" ||
-        statusUpper === "REVERSED"
-      ) {
+      } else if (statusUpper === "FAILED" || statusUpper === "REVERSED") {
         if (statusUpper === "FAILED") {
           await supabase
             .from("payout_requests")
@@ -636,7 +637,9 @@ app.get("/api/banks", async (req, res) => {
     }
 
     if (!FLUTTERWAVE_SECRET_KEY) {
-      console.error("Cannot fetch banks: FLUTTERWAVE_SECRET_KEY not configured");
+      console.error(
+        "Cannot fetch banks: FLUTTERWAVE_SECRET_KEY not configured",
+      );
       return res
         .status(503)
         .json({ error: "Payment gateway not configured — cannot load banks" });
@@ -710,7 +713,9 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
       );
       return res
         .status(503)
-        .json({ error: "Payment gateway not configured — cannot verify account" });
+        .json({
+          error: "Payment gateway not configured — cannot verify account",
+        });
     }
 
     try {
@@ -721,8 +726,7 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
 
       if (
         response.data &&
-        (response.data.status === "success" ||
-          response.data.data?.account_name)
+        (response.data.status === "success" || response.data.data?.account_name)
       ) {
         const accountName = response.data.data?.account_name || "";
         if (accountName) {
@@ -1206,6 +1210,100 @@ app.get("/api/quiz/:id/analytics", authenticateRequest, async (req, res) => {
 });
 
 app.post(
+  "/api/creator/courses/upsert",
+  authenticateRequest,
+  async (req, res) => {
+    try {
+      const {
+        code,
+        name,
+        subject_area,
+        level,
+        is_computational,
+        university_id,
+      } = req.body || {};
+
+      // ── Validate required fields ──────────────────────────────────────────
+      if (
+        !code ||
+        typeof code !== "string" ||
+        !code.trim() ||
+        !name ||
+        typeof name !== "string" ||
+        !name.trim() ||
+        !university_id ||
+        typeof university_id !== "string"
+      ) {
+        return res
+          .status(400)
+          .json({ error: "code, name, and university_id are required." });
+      }
+
+      const courseCode = code.trim().toUpperCase();
+      const courseName = name.trim();
+      const levelNum =
+        typeof level === "number" && Number.isFinite(level) ? level : null;
+
+      // ── Check for existing course (same code + university) ────────────────
+      const { data: existing, error: findErr } = await supabase
+        .from("courses")
+        .select("id")
+        .eq("code", courseCode)
+        .eq("university_id", university_id)
+        .maybeSingle();
+
+      if (findErr) {
+        console.error("Course upsert lookup error:", findErr);
+        return res.status(500).json({ error: "Failed to look up course." });
+      }
+
+      if (existing) {
+        // Update metadata on the existing row
+        const { data: updated, error: updateErr } = await supabase
+          .from("courses")
+          .update({
+            name: courseName,
+            subject_area: subject_area ?? null,
+            level: levelNum,
+          })
+          .eq("id", existing.id)
+          .select("id")
+          .single();
+
+        if (updateErr) {
+          console.error("Course upsert update error:", updateErr);
+          return res.status(500).json({ error: "Failed to update course." });
+        }
+        return res.json({ course_id: updated.id, created: false });
+      }
+
+      // ── Insert new course ─────────────────────────────────────────────────
+      const { data: inserted, error: insertErr } = await supabase
+        .from("courses")
+        .insert({
+          name: courseName,
+          code: courseCode,
+          subject_area: subject_area ?? null,
+          level: levelNum,
+          is_computational: is_computational ?? false,
+          university_id,
+        })
+        .select("id")
+        .single();
+
+      if (insertErr || !inserted) {
+        console.error("Course upsert insert error:", insertErr);
+        return res.status(500).json({ error: "Failed to create course." });
+      }
+      return res.status(201).json({ course_id: inserted.id, created: true });
+    } catch (err) {
+      console.error("Course upsert outer error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+app.post(
   "/api/creator/payout-request",
   authenticateRequest,
   async (req, res) => {
@@ -1305,7 +1403,6 @@ app.post(
   },
 );
 
-
 /* Transfer to creators endpoint */
 app.post(
   "/api/admin/payout-requests/:id/approve",
@@ -1368,8 +1465,7 @@ app.post(
 
         // Any other status (processing / paid / rejected): already in flight or final
         return res.status(409).json({
-          error:
-            "This payout has already been processed or is being processed",
+          error: "This payout has already been processed or is being processed",
         });
       }
 
@@ -1518,8 +1614,7 @@ async function _continuePayoutApprove(payoutRequest, res) {
         payout_request_id: payoutRequestId,
         transfer_reference: transferRef,
         demo_mode: true,
-        note:
-          "DEMO MODE: transfer not actually sent. Set PAYOUT_MODE=live and provide FLUTTERWAVE_SECRET_KEY for real payouts.",
+        note: "DEMO MODE: transfer not actually sent. Set PAYOUT_MODE=live and provide FLUTTERWAVE_SECRET_KEY for real payouts.",
       });
     }
 
