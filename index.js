@@ -2076,35 +2076,63 @@ app.post(
 
 // ─── Admin Management Endpoints ─────────────────────────────────────────────
 
-// GET /api/admin/users — profiles + auth emails
+// GET /api/admin/users — paginated profiles + auth emails
 app.get(
   "/api/admin/users",
   authenticateRequest,
   requireAdmin,
   async (req, res) => {
     try {
-      const { data: profiles, error: profErr } = await supabase
+      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+      const pageSize = Math.min(
+        100,
+        Math.max(1, Number.parseInt(req.query.pageSize, 10) || 25),
+      );
+      const role = String(req.query.role || "all");
+      const universityId = String(req.query.universityId || "all");
+      const search = String(req.query.search || "").trim();
+
+      let profilesQuery = supabase
         .from("profiles")
-        .select("*")
+        .select("*", { count: "exact" })
         .order("created_at", { ascending: false });
+
+      if (role === "users") profilesQuery = profilesQuery.eq("role", "user").eq("is_suspended", false);
+      else if (role === "creators") profilesQuery = profilesQuery.eq("role", "creator");
+      else if (role === "admins") profilesQuery = profilesQuery.eq("role", "admin");
+      else if (role === "suspended") profilesQuery = profilesQuery.eq("is_suspended", true);
+      if (universityId !== "all") profilesQuery = profilesQuery.eq("university_id", universityId);
+      if (search) profilesQuery = profilesQuery.ilike("full_name", `%${search.replace(/[%,]/g, "")}%`);
+
+      const start = (page - 1) * pageSize;
+      const { data: profiles, count, error: profErr } = await profilesQuery.range(
+        start,
+        start + pageSize - 1,
+      );
       if (profErr)
         return res.status(500).json({ error: "Failed to fetch profiles" });
 
-      const { data: authData, error: authErr } =
-        await supabase.auth.admin.listUsers({ perPage: 1000 });
-      const emailMap = {};
-      if (!authErr && authData?.users) {
-        authData.users.forEach((u) => {
-          emailMap[u.id] = u.email;
-        });
-      }
+      // Resolve emails only for the page being returned; never load the full
+      // auth directory just to render one admin page.
+      const authUsers = await Promise.all(
+        (profiles || []).map(async (profile) => {
+          const { data } = await supabase.auth.admin.getUserById(profile.id);
+          return [profile.id, data?.user?.email || null];
+        }),
+      );
+      const emailMap = Object.fromEntries(authUsers);
 
       const enriched = (profiles || []).map((p) => ({
         ...p,
         email: emailMap[p.id] || null,
       }));
 
-      return res.json({ users: enriched });
+      return res.json({
+        users: enriched,
+        total: count || 0,
+        page,
+        pageSize,
+      });
     } catch (err) {
       console.error("Admin get users error:", err);
       return res.status(500).json({ error: "Internal server error" });
