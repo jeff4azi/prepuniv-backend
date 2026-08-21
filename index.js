@@ -879,6 +879,41 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
     const isFirstTime = !existingPay;
     const version = await syncQuizVersion(quiz.id);
 
+    // Retake path — the user has already paid, so just create a new
+    // (free) attempt row. Shared by two callers: the normal "already
+    // paid" branch below, AND the race-fallback below it, for when a
+    // concurrent request for the same user+quiz wins the charge and
+    // this one loses — see the unique-violation handling further down.
+    const createFreeAttempt = async () => {
+      const attemptId = "att_" + crypto.randomUUID();
+
+      const { data: attempt, error: attemptErr } = await supabase
+        .from("quiz_attempts")
+        .insert({
+          id: attemptId,
+          user_id: req.user.id,
+          quiz_id: quiz.id,
+          quiz_version_id: version?.id || null,
+          is_timed: !!is_timed,
+          time_allowed_seconds: is_timed
+            ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) ||
+              null
+            : null,
+        })
+        .select()
+        .single();
+
+      if (attemptErr) throw attemptErr;
+
+      return res.json({
+        attempt_id: attempt.id,
+        quiz_id: attempt.quiz_id,
+        quiz_version_id: attempt.quiz_version_id,
+        questions: version?.questions_snapshot || [],
+        ...attempt,
+      });
+    };
+
     if (isFirstTime) {
       const { data: balanceRow, error: balanceErr } = await supabase
         .from("user_balances")
@@ -904,7 +939,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       const payRef = "quizpay_" + crypto.randomUUID();
       const paymentTxnId = "wtx_" + crypto.randomUUID();
 
-      await supabase.from("wallet_transactions").insert({
+      const { error: payErr } = await supabase.from("wallet_transactions").insert({
         id: paymentTxnId,
         user_id: req.user.id,
         amount: -priceNaira,
@@ -914,6 +949,24 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
         related_quiz_id: quiz.id,
         related_attempt_id: attemptId,
       });
+
+      if (payErr) {
+        // 23505 = unique_violation on the partial unique index added in
+        // migration 037 (user_id, related_quiz_id) where type =
+        // 'quiz_payment' and status = 'completed'. This means a
+        // concurrent request for the same user+quiz — e.g. a fast
+        // double-tap, or a client retry firing before the first
+        // request's response came back — already recorded the
+        // completed payment in between our check above and this insert.
+        // The user has genuinely already paid: give them the same free
+        // attempt a normal retake would get, don't charge them again,
+        // and don't surface this as an error.
+        if (payErr.code === "23505") {
+          return createFreeAttempt();
+        }
+        console.error("Wallet transaction insert error:", payErr);
+        return res.status(500).json({ error: "Failed to record payment" });
+      }
 
       const { data: attempt, error: attemptErr } = await supabase
         .from("quiz_attempts")
@@ -942,33 +995,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       });
     } else {
       // Retake — already paid, just create a new attempt row (no charge)
-      const attemptId = "att_" + crypto.randomUUID();
-
-      const { data: attempt, error: attemptErr } = await supabase
-        .from("quiz_attempts")
-        .insert({
-          id: attemptId,
-          user_id: req.user.id,
-          quiz_id: quiz.id,
-          quiz_version_id: version?.id || null,
-          is_timed: !!is_timed,
-          time_allowed_seconds: is_timed
-            ? Number(time_allowed_seconds || quiz.time_limit_seconds || 0) ||
-              null
-            : null,
-        })
-        .select()
-        .single();
-
-      if (attemptErr) throw attemptErr;
-
-      return res.json({
-        attempt_id: attempt.id,
-        quiz_id: attempt.quiz_id,
-        quiz_version_id: attempt.quiz_version_id,
-        questions: version?.questions_snapshot || [],
-        ...attempt,
-      });
+      return createFreeAttempt();
     }
   } catch (err) {
     console.error("Quiz attempt error:", err);
