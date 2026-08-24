@@ -221,6 +221,18 @@ app.post(
 
       let payment_link = null;
       try {
+        const { data: profile } = await supabase
+          .from("profiles")
+          .select("full_name")
+          .eq("id", req.user.id)
+          .maybeSingle();
+
+        const customerName =
+          profile?.full_name ||
+          req.user.user_metadata?.full_name ||
+          req.user.user_metadata?.name ||
+          "";
+
         const response = await flutterwaveAxios.post("/payments", {
           tx_ref,
           amount,
@@ -228,6 +240,11 @@ app.post(
           redirect_url: `${CORS_ALLOWED_ORIGIN}/wallet?tx_ref=${tx_ref}`,
           customer: {
             email: req.user.email,
+            ...(customerName ? { name: customerName } : {}),
+          },
+          customizations: {
+            title: "PREPUNIV Wallet Top-up",
+            description: "Account balance top-up",
           },
           meta: {
             user_id: req.user.id,
