@@ -5,6 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { calculatePaymentProcessingFee } from "./feeCalculator.js";
 
 dotenv.config();
 
@@ -207,6 +208,12 @@ app.post(
           id: "wtx_" + crypto.randomUUID(),
           user_id: req.user.id,
           amount,
+          gross_amount: amount,
+          net_amount: amount,
+          processing_fee: 0,
+          vat_fee: 0,
+          platform_fee: 0,
+          fee_is_estimated: false,
           type: "topup",
           status: "pending",
           reference: tx_ref,
@@ -507,16 +514,13 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
         console.error("Wallet transaction lookup error:", lookupErr);
       } else if (txRow) {
         if (verifyStatus === "successful") {
-          const { error: updateErr } = await supabase
-            .from("wallet_transactions")
-            .update({ status: "completed" })
-            .eq("id", txRow.id);
-          if (updateErr) console.error("Webhook update error:", updateErr);
+          await completeTopupTransaction(txRow, verifyData);
         } else if (verifyStatus === "failed") {
           const { error: updateErr } = await supabase
             .from("wallet_transactions")
             .update({ status: "failed" })
-            .eq("id", txRow.id);
+            .eq("id", txRow.id)
+            .eq("status", "pending");
           if (updateErr)
             console.error("Webhook failed-update error:", updateErr);
         }
@@ -531,6 +535,57 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
     return res.status(200).json({ ok: true });
   }
 });
+
+/**
+ * Idempotent topup completion helper.
+ * Calculates platform processing fees, records fee accounting on the transaction row,
+ * and performs an atomic status transition from 'pending' to 'completed'.
+ */
+async function completeTopupTransaction(txRow, verifyData = null) {
+  if (!txRow) return { success: false, error: "Transaction required" };
+
+  if (txRow.status === "completed") {
+    return { status: "completed", already_completed: true };
+  }
+  if (txRow.status === "failed") {
+    return { status: "failed", already_failed: true };
+  }
+
+  const actualGatewayFee = verifyData?.app_fee ?? verifyData?.fee ?? null;
+  const grossAmount = Number(txRow.gross_amount || txRow.amount || 0);
+  const feeBreakdown = calculatePaymentProcessingFee(
+    grossAmount,
+    actualGatewayFee,
+  );
+
+  const { data: updatedTx, error: updateErr } = await supabase
+    .from("wallet_transactions")
+    .update({
+      status: "completed",
+      gross_amount: feeBreakdown.grossAmount,
+      processing_fee: feeBreakdown.processingFee,
+      vat_fee: feeBreakdown.vatOnProcessingFee,
+      platform_fee: feeBreakdown.totalPlatformFee,
+      net_amount: feeBreakdown.netAmount,
+      fee_rate: feeBreakdown.feeRate,
+      fee_is_estimated: feeBreakdown.feeIsEstimated,
+    })
+    .eq("id", txRow.id)
+    .eq("status", "pending")
+    .select()
+    .maybeSingle();
+
+  if (updateErr) {
+    console.error("Topup transaction completion update error:", updateErr);
+    return { success: false, error: updateErr.message };
+  }
+
+  return {
+    status: "completed",
+    already_completed: !updatedTx,
+    tx: updatedTx || txRow,
+  };
+}
 
 /**
  * POST /api/wallet/topup/verify
@@ -605,26 +660,29 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
     }
 
     if (fwStatus === "successful") {
-      const { error: updateErr } = await supabase
-        .from("wallet_transactions")
-        .update({ status: "completed" })
-        .eq("id", txRow.id);
+      const result = await completeTopupTransaction(
+        txRow,
+        verifyRefData || verifyRespData,
+      );
 
-      if (updateErr) {
-        console.error("Topup verify update error:", updateErr);
+      if (result.error) {
         return res
           .status(500)
           .json({ error: "Failed to update transaction status" });
       }
 
-      return res.json({ status: "completed" });
+      return res.json({
+        status: "completed",
+        already_completed: !!result.already_completed,
+      });
     }
 
     if (fwStatus === "failed") {
       await supabase
         .from("wallet_transactions")
         .update({ status: "failed" })
-        .eq("id", txRow.id);
+        .eq("id", txRow.id)
+        .eq("status", "pending");
 
       return res.json({ status: "failed" });
     }
