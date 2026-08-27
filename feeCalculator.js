@@ -31,12 +31,14 @@ export function roundToFiveDecimals(num) {
  * Calculates payment processing fees for top-ups.
  *
  * @param {number} grossAmount - The amount paid by customer in NGN (Naira).
- * @param {number|null} actualGatewayFee - Optional confirmed gateway fee from Flutterwave response.
+ * @param {number|null} actualGatewayFee - Optional confirmed base gateway fee from Flutterwave (before 7.5% VAT).
+ * @param {number|null} amountSettled - Optional confirmed settled amount from Flutterwave.
  * @returns {object} Fee calculation breakdown.
  */
 export function calculatePaymentProcessingFee(
   grossAmount,
   actualGatewayFee = null,
+  amountSettled = null,
 ) {
   const numericGross = Math.max(0, Number(grossAmount) || 0);
 
@@ -52,26 +54,50 @@ export function calculatePaymentProcessingFee(
     };
   }
 
-  // If gateway reported an explicit total fee, use it
+  // 1. If gateway reported an explicit settled amount (e.g. 97.85 NGN)
   if (
-    actualGatewayFee !== null &&
-    actualGatewayFee !== undefined &&
-    !isNaN(Number(actualGatewayFee))
+    amountSettled !== null &&
+    amountSettled !== undefined &&
+    !isNaN(Number(amountSettled)) &&
+    Number(amountSettled) > 0
   ) {
-    const totalPlatformFee = roundToTwoDecimals(
-      Math.max(0, Number(actualGatewayFee)),
-    );
+    const numericSettled = Number(amountSettled);
+    const totalPlatformFee = roundToTwoDecimals(numericGross - numericSettled);
     const processingFee = roundToTwoDecimals(
       totalPlatformFee / (1 + FEE_CONFIG.VAT_RATE),
     );
     const vatOnProcessingFee = roundToTwoDecimals(
       totalPlatformFee - processingFee,
     );
+    const feeRate = roundToFiveDecimals(totalPlatformFee / numericGross);
+
+    return {
+      grossAmount: numericGross,
+      processingFee,
+      vatOnProcessingFee,
+      totalPlatformFee,
+      netAmount: roundToTwoDecimals(numericSettled),
+      feeRate,
+      feeIsEstimated: false,
+    };
+  }
+
+  // 2. If gateway reported explicit base fee (e.g. 2.00 NGN)
+  if (
+    actualGatewayFee !== null &&
+    actualGatewayFee !== undefined &&
+    !isNaN(Number(actualGatewayFee))
+  ) {
+    const baseFee = Math.max(0, Number(actualGatewayFee));
+    const processingFee = roundToTwoDecimals(baseFee);
+    const vatOnProcessingFee = roundToTwoDecimals(
+      processingFee * FEE_CONFIG.VAT_RATE,
+    );
+    const totalPlatformFee = roundToTwoDecimals(
+      processingFee + vatOnProcessingFee,
+    );
     const netAmount = roundToTwoDecimals(numericGross - totalPlatformFee);
-    const feeRate =
-      numericGross > 0
-        ? roundToFiveDecimals(totalPlatformFee / numericGross)
-        : 0;
+    const feeRate = roundToFiveDecimals(totalPlatformFee / numericGross);
 
     return {
       grossAmount: numericGross,
@@ -84,7 +110,7 @@ export function calculatePaymentProcessingFee(
     };
   }
 
-  // Formula-based fee calculation
+  // 3. Formula-based fee calculation (2.0% processing fee + 7.5% VAT = 2.15% effective rate)
   const uncappedProcessingFee = numericGross * FEE_CONFIG.PROCESSING_FEE_RATE;
   const processingFee = roundToTwoDecimals(
     Math.min(uncappedProcessingFee, FEE_CONFIG.PROCESSING_FEE_CAP),

@@ -547,19 +547,40 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
 async function completeTopupTransaction(txRow, verifyData = null) {
   if (!txRow) return { success: false, error: "Transaction required" };
 
-  if (txRow.status === "completed") {
-    return { status: "completed", already_completed: true };
-  }
   if (txRow.status === "failed") {
     return { status: "failed", already_failed: true };
   }
 
   const actualGatewayFee = verifyData?.app_fee ?? verifyData?.fee ?? null;
+  const amountSettled = verifyData?.amount_settled ?? verifyData?.settled_amount ?? null;
   const grossAmount = Number(txRow.gross_amount || txRow.amount || 0);
   const feeBreakdown = calculatePaymentProcessingFee(
     grossAmount,
     actualGatewayFee,
+    amountSettled,
   );
+
+  if (txRow.status === "completed") {
+    // If fee accounting was inaccurate (e.g. platform_fee recorded as 2 instead of 2.15), update fee fields
+    if (
+      Number(txRow.platform_fee) !== feeBreakdown.totalPlatformFee ||
+      Number(txRow.net_amount) !== feeBreakdown.netAmount
+    ) {
+      await supabase
+        .from("wallet_transactions")
+        .update({
+          gross_amount: feeBreakdown.grossAmount,
+          processing_fee: feeBreakdown.processingFee,
+          vat_fee: feeBreakdown.vatOnProcessingFee,
+          platform_fee: feeBreakdown.totalPlatformFee,
+          net_amount: feeBreakdown.netAmount,
+          fee_rate: feeBreakdown.feeRate,
+          fee_is_estimated: feeBreakdown.feeIsEstimated,
+        })
+        .eq("id", txRow.id);
+    }
+    return { status: "completed", already_completed: true };
+  }
 
   const { data: updatedTx, error: updateErr } = await supabase
     .from("wallet_transactions")
@@ -594,11 +615,13 @@ async function completeTopupTransaction(txRow, verifyData = null) {
  * Server-side Background Topup Reconciliation Helper.
  * Periodically queries Flutterwave for all pending wallet top-up transactions
  * and updates their status in Supabase if completed or failed on Flutterwave.
+ * Also audits completed top-ups to ensure fee accounting correctly reflects VAT.
  */
 async function reconcilePendingTopups() {
   if (!FLUTTERWAVE_SECRET_KEY) return { reconciled: 0, errors: 0 };
 
   try {
+    // 1. Reconcile pending topups
     const { data: pendingTxns, error } = await supabase
       .from("wallet_transactions")
       .select("*")
@@ -606,74 +629,100 @@ async function reconcilePendingTopups() {
       .eq("status", "pending")
       .order("created_at", { ascending: true });
 
-    if (error || !pendingTxns || pendingTxns.length === 0) {
-      return { reconciled: 0, errors: 0 };
-    }
-
     let reconciledCount = 0;
     let errorCount = 0;
 
-    for (const txRow of pendingTxns) {
-      try {
-        const tx_ref = txRow.reference;
-        if (!tx_ref) continue;
+    if (!error && pendingTxns && pendingTxns.length > 0) {
+      for (const txRow of pendingTxns) {
+        try {
+          const tx_ref = txRow.reference;
+          if (!tx_ref) continue;
 
-        let fwStatus = null;
-        let verifyData = null;
+          let fwStatus = null;
+          let verifyData = null;
 
-        const verifyRefResp = await flutterwaveAxios.get(
-          "/transactions/verify_by_reference",
-          { params: { tx_ref } },
-        );
-        const verifyRefData = verifyRefResp.data?.data;
-        const txId = verifyRefData?.id;
-
-        if (txId) {
-          const verifyResp = await flutterwaveAxios.get(
-            `/transactions/${txId}/verify`,
+          const verifyRefResp = await flutterwaveAxios.get(
+            "/transactions/verify_by_reference",
+            { params: { tx_ref } },
           );
-          verifyData = verifyResp.data?.data;
-          fwStatus = verifyData?.status;
-        } else {
-          verifyData = verifyRefData;
-          fwStatus = verifyRefData?.status;
-        }
+          const verifyRefData = verifyRefResp.data?.data;
+          const txId = verifyRefData?.id;
 
-        const ageMs = Date.now() - new Date(txRow.created_at).getTime();
+          if (txId) {
+            const verifyResp = await flutterwaveAxios.get(
+              `/transactions/${txId}/verify`,
+            );
+            verifyData = verifyResp.data?.data;
+            fwStatus = verifyData?.status;
+          } else {
+            verifyData = verifyRefData;
+            fwStatus = verifyRefData?.status;
+          }
 
-        if (fwStatus === "successful") {
-          const res = await completeTopupTransaction(txRow, verifyData);
-          if (res.status === "completed") reconciledCount++;
-        } else if (fwStatus && fwStatus !== "pending") {
-          // Any explicit non-successful and non-pending status (e.g. failed, cancelled, expired)
-          await supabase
-            .from("wallet_transactions")
-            .update({ status: "failed" })
-            .eq("id", txRow.id)
-            .eq("status", "pending");
-          reconciledCount++;
-        } else if (ageMs > 15 * 60 * 1000) {
-          // If transaction has been pending for over 15 minutes without success, mark as failed/cancelled
-          await supabase
-            .from("wallet_transactions")
-            .update({ status: "failed" })
-            .eq("id", txRow.id)
-            .eq("status", "pending");
-          reconciledCount++;
+          const ageMs = Date.now() - new Date(txRow.created_at).getTime();
+
+          if (fwStatus === "successful") {
+            const res = await completeTopupTransaction(txRow, verifyData);
+            if (res.status === "completed") reconciledCount++;
+          } else if (fwStatus && fwStatus !== "pending") {
+            await supabase
+              .from("wallet_transactions")
+              .update({ status: "failed" })
+              .eq("id", txRow.id)
+              .eq("status", "pending");
+            reconciledCount++;
+          } else if (ageMs > 15 * 60 * 1000) {
+            await supabase
+              .from("wallet_transactions")
+              .update({ status: "failed" })
+              .eq("id", txRow.id)
+              .eq("status", "pending");
+            reconciledCount++;
+          }
+        } catch (itemErr) {
+          const ageMs = Date.now() - new Date(txRow.created_at).getTime();
+          if (itemErr.response?.status === 404 && ageMs > 10 * 60 * 1000) {
+            await supabase
+              .from("wallet_transactions")
+              .update({ status: "failed" })
+              .eq("id", txRow.id)
+              .eq("status", "pending");
+            reconciledCount++;
+          } else {
+            errorCount++;
+          }
         }
-      } catch (itemErr) {
-        const ageMs = Date.now() - new Date(txRow.created_at).getTime();
-        // If Flutterwave returns 404 (no transaction found for tx_ref) and topup is older than 10 minutes,
-        // mark as failed (cancelled) instead of keeping pending forever.
-        if (itemErr.response?.status === 404 && ageMs > 10 * 60 * 1000) {
+      }
+    }
+
+    // 2. Audit completed topups for any inaccurate platform fee calculations (e.g. N2 instead of N2.15)
+    const { data: completedTxns } = await supabase
+      .from("wallet_transactions")
+      .select("*")
+      .eq("type", "topup")
+      .eq("status", "completed");
+
+    if (completedTxns && completedTxns.length > 0) {
+      for (const txRow of completedTxns) {
+        const grossAmount = Number(txRow.gross_amount || txRow.amount || 0);
+        // Base fee reported by gateway (if platform_fee was 2 for 100 gross, base fee was 2)
+        const currentFee = Number(txRow.platform_fee || 0);
+        const expectedFee = roundToTwoDecimals(grossAmount * 0.0215);
+
+        // If platform fee was recorded as 2.00 instead of 2.15 for N100 topups
+        if (currentFee > 0 && Math.abs(currentFee - expectedFee) > 0.01 && Math.abs(currentFee - (grossAmount * 0.02)) < 0.02) {
+          const corrected = calculatePaymentProcessingFee(grossAmount, grossAmount * 0.02);
           await supabase
             .from("wallet_transactions")
-            .update({ status: "failed" })
-            .eq("id", txRow.id)
-            .eq("status", "pending");
+            .update({
+              processing_fee: corrected.processingFee,
+              vat_fee: corrected.vatOnProcessingFee,
+              platform_fee: corrected.totalPlatformFee,
+              net_amount: corrected.netAmount,
+              fee_rate: corrected.feeRate,
+            })
+            .eq("id", txRow.id);
           reconciledCount++;
-        } else {
-          errorCount++;
         }
       }
     }
