@@ -294,16 +294,9 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
     }
 
     const verifHash = req.headers["verif-hash"];
-    const rawBody = req.rawBody ?? JSON.stringify(req.body);
-    const expectedHash = crypto
-      .createHmac("sha256", FLUTTERWAVE_WEBHOOK_SECRET)
-      .update(rawBody)
-      .digest("hex");
-
-    if (verifHash !== expectedHash) {
+    if (!verifHash || verifHash !== FLUTTERWAVE_WEBHOOK_SECRET) {
       console.warn("Webhook signature mismatch — ignoring", {
         verifHash,
-        expectedHash,
       });
       return res.status(403).json({ error: "Invalid webhook signature" });
     }
@@ -488,45 +481,55 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    // ─── Topup webhook handling (existing logic) ──────────────────────────
+    // ─── Topup webhook handling ──────────────────────────
     const tx_ref = body?.data?.tx_ref ?? body?.tx_ref;
     const transaction_id = body?.data?.id ?? body?.transaction_id;
 
-    if (!tx_ref || !transaction_id) {
-      return res.status(200).json({ ok: true });
-    }
+    if (tx_ref) {
+      try {
+        let verifyData = null;
+        let verifyStatus = null;
 
-    try {
-      const verifyResp = await flutterwaveAxios.get(
-        `/transactions/${transaction_id}/verify`,
-      );
-      const verifyData = verifyResp.data?.data;
-      const verifyStatus = verifyData?.status;
-
-      const { data: txRow, error: lookupErr } = await supabase
-        .from("wallet_transactions")
-        .select("*")
-        .eq("reference", tx_ref)
-        .eq("status", "pending")
-        .maybeSingle();
-
-      if (lookupErr) {
-        console.error("Wallet transaction lookup error:", lookupErr);
-      } else if (txRow) {
-        if (verifyStatus === "successful") {
-          await completeTopupTransaction(txRow, verifyData);
-        } else if (verifyStatus === "failed") {
-          const { error: updateErr } = await supabase
-            .from("wallet_transactions")
-            .update({ status: "failed" })
-            .eq("id", txRow.id)
-            .eq("status", "pending");
-          if (updateErr)
-            console.error("Webhook failed-update error:", updateErr);
+        if (transaction_id) {
+          const verifyResp = await flutterwaveAxios.get(
+            `/transactions/${transaction_id}/verify`,
+          );
+          verifyData = verifyResp.data?.data;
+          verifyStatus = verifyData?.status;
+        } else {
+          const verifyRefResp = await flutterwaveAxios.get(
+            "/transactions/verify_by_reference",
+            { params: { tx_ref } },
+          );
+          verifyData = verifyRefResp.data?.data;
+          verifyStatus = verifyData?.status;
         }
+
+        const { data: txRow, error: lookupErr } = await supabase
+          .from("wallet_transactions")
+          .select("*")
+          .eq("reference", tx_ref)
+          .eq("status", "pending")
+          .maybeSingle();
+
+        if (lookupErr) {
+          console.error("Wallet transaction lookup error:", lookupErr);
+        } else if (txRow) {
+          if (verifyStatus === "successful") {
+            await completeTopupTransaction(txRow, verifyData);
+          } else if (verifyStatus === "failed" || verifyStatus === "cancelled") {
+            const { error: updateErr } = await supabase
+              .from("wallet_transactions")
+              .update({ status: "failed" })
+              .eq("id", txRow.id)
+              .eq("status", "pending");
+            if (updateErr)
+              console.error("Webhook failed-update error:", updateErr);
+          }
+        }
+      } catch (verifyErr) {
+        console.error("Flutterwave verify error:", verifyErr.message);
       }
-    } catch (verifyErr) {
-      console.error("Flutterwave verify error:", verifyErr.message);
     }
 
     return res.status(200).json({ ok: true });
@@ -588,6 +591,102 @@ async function completeTopupTransaction(txRow, verifyData = null) {
 }
 
 /**
+ * Server-side Background Topup Reconciliation Helper.
+ * Periodically queries Flutterwave for all pending wallet top-up transactions
+ * and updates their status in Supabase if completed or failed on Flutterwave.
+ */
+async function reconcilePendingTopups() {
+  if (!FLUTTERWAVE_SECRET_KEY) return { reconciled: 0, errors: 0 };
+
+  try {
+    const { data: pendingTxns, error } = await supabase
+      .from("wallet_transactions")
+      .select("*")
+      .eq("type", "topup")
+      .eq("status", "pending")
+      .order("created_at", { ascending: true });
+
+    if (error || !pendingTxns || pendingTxns.length === 0) {
+      return { reconciled: 0, errors: 0 };
+    }
+
+    let reconciledCount = 0;
+    let errorCount = 0;
+
+    for (const txRow of pendingTxns) {
+      try {
+        const tx_ref = txRow.reference;
+        if (!tx_ref) continue;
+
+        let fwStatus = null;
+        let verifyData = null;
+
+        const verifyRefResp = await flutterwaveAxios.get(
+          "/transactions/verify_by_reference",
+          { params: { tx_ref } },
+        );
+        const verifyRefData = verifyRefResp.data?.data;
+        const txId = verifyRefData?.id;
+
+        if (txId) {
+          const verifyResp = await flutterwaveAxios.get(
+            `/transactions/${txId}/verify`,
+          );
+          verifyData = verifyResp.data?.data;
+          fwStatus = verifyData?.status;
+        } else {
+          verifyData = verifyRefData;
+          fwStatus = verifyRefData?.status;
+        }
+
+        if (fwStatus === "successful") {
+          const res = await completeTopupTransaction(txRow, verifyData);
+          if (res.status === "completed") reconciledCount++;
+        } else if (fwStatus === "failed" || fwStatus === "cancelled") {
+          await supabase
+            .from("wallet_transactions")
+            .update({ status: "failed" })
+            .eq("id", txRow.id)
+            .eq("status", "pending");
+          reconciledCount++;
+        }
+      } catch (itemErr) {
+        const ageMs = Date.now() - new Date(txRow.created_at).getTime();
+        const IS_OLDER_THAN_24H = ageMs > 24 * 60 * 60 * 1000;
+        if (itemErr.response?.status === 404 && IS_OLDER_THAN_24H) {
+          await supabase
+            .from("wallet_transactions")
+            .update({ status: "failed" })
+            .eq("id", txRow.id)
+            .eq("status", "pending");
+          reconciledCount++;
+        } else {
+          errorCount++;
+        }
+      }
+    }
+
+    if (reconciledCount > 0) {
+      console.log(`Topup reconciliation: auto-reconciled ${reconciledCount} pending topups.`);
+    }
+    return { reconciled: reconciledCount, errors: errorCount, total: pendingTxns.length };
+  } catch (err) {
+    console.error("Topup background reconciliation error:", err.message);
+    return { reconciled: 0, errors: 1 };
+  }
+}
+
+// Start periodic background topup reconciliation every 3 minutes
+setInterval(() => {
+  void reconcilePendingTopups();
+}, 3 * 60 * 1000);
+
+// Run initial reconciliation 10 seconds after server startup
+setTimeout(() => {
+  void reconcilePendingTopups();
+}, 10 * 1000);
+
+/**
  * POST /api/wallet/topup/verify
  *
  * Safety-net for the Flutterwave redirect-back flow.
@@ -634,6 +733,7 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
 
     // Query Flutterwave by tx_ref using the dedicated verify_by_reference endpoint
     let fwStatus = null;
+    let verifyData = null;
     try {
       const verifyRefResp = await flutterwaveAxios.get(
         "/transactions/verify_by_reference",
@@ -646,8 +746,10 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
         const verifyResp = await flutterwaveAxios.get(
           `/transactions/${txId}/verify`,
         );
-        fwStatus = verifyResp.data?.data?.status;
+        verifyData = verifyResp.data?.data;
+        fwStatus = verifyData?.status;
       } else {
+        verifyData = verifyRefData;
         fwStatus = verifyRefData?.status;
       }
     } catch (fwErr) {
@@ -662,7 +764,7 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
     if (fwStatus === "successful") {
       const result = await completeTopupTransaction(
         txRow,
-        verifyRefData || verifyRespData,
+        verifyData,
       );
 
       if (result.error) {
@@ -677,7 +779,7 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
       });
     }
 
-    if (fwStatus === "failed") {
+    if (fwStatus === "failed" || fwStatus === "cancelled") {
       await supabase
         .from("wallet_transactions")
         .update({ status: "failed" })
@@ -693,6 +795,22 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// POST /api/admin/topups/reconcile — Admin manual reconciliation of all pending top-ups
+app.post(
+  "/api/admin/topups/reconcile",
+  authenticateRequest,
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const stats = await reconcilePendingTopups();
+      return res.json({ ok: true, stats });
+    } catch (err) {
+      console.error("Admin topup reconcile error:", err);
+      return res.status(500).json({ error: "Failed to reconcile top-ups" });
+    }
+  },
+);
 
 // ─── Nigerian Banks Data & Flutterwave Integration ────────────────────────────
 let cachedBanksList = null;
