@@ -5,7 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { calculatePaymentProcessingFee } from "./feeCalculator.js";
+import { calculatePaymentProcessingFee, roundToTwoDecimals } from "./feeCalculator.js";
 
 dotenv.config();
 
@@ -705,21 +705,30 @@ async function reconcilePendingTopups() {
     if (completedTxns && completedTxns.length > 0) {
       for (const txRow of completedTxns) {
         const grossAmount = Number(txRow.gross_amount || txRow.amount || 0);
-        // Base fee reported by gateway (if platform_fee was 2 for 100 gross, base fee was 2)
-        const currentFee = Number(txRow.platform_fee || 0);
-        const expectedFee = roundToTwoDecimals(grossAmount * 0.0215);
+        if (grossAmount <= 0) continue;
 
-        // If platform fee was recorded as 2.00 instead of 2.15 for N100 topups
-        if (currentFee > 0 && Math.abs(currentFee - expectedFee) > 0.01 && Math.abs(currentFee - (grossAmount * 0.02)) < 0.02) {
-          const corrected = calculatePaymentProcessingFee(grossAmount, grossAmount * 0.02);
+        const corrected = calculatePaymentProcessingFee(
+          grossAmount,
+          grossAmount * 0.02,
+        );
+
+        const currentFee = Number(txRow.platform_fee || 0);
+        const currentNet = Number(txRow.net_amount || 0);
+
+        if (
+          currentFee !== corrected.totalPlatformFee ||
+          currentNet !== corrected.netAmount
+        ) {
           await supabase
             .from("wallet_transactions")
             .update({
+              gross_amount: corrected.grossAmount,
               processing_fee: corrected.processingFee,
               vat_fee: corrected.vatOnProcessingFee,
               platform_fee: corrected.totalPlatformFee,
               net_amount: corrected.netAmount,
               fee_rate: corrected.feeRate,
+              fee_is_estimated: corrected.feeIsEstimated,
             })
             .eq("id", txRow.id);
           reconciledCount++;
