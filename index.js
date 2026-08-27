@@ -639,10 +639,21 @@ async function reconcilePendingTopups() {
           fwStatus = verifyRefData?.status;
         }
 
+        const ageMs = Date.now() - new Date(txRow.created_at).getTime();
+
         if (fwStatus === "successful") {
           const res = await completeTopupTransaction(txRow, verifyData);
           if (res.status === "completed") reconciledCount++;
-        } else if (fwStatus === "failed" || fwStatus === "cancelled") {
+        } else if (fwStatus && fwStatus !== "pending") {
+          // Any explicit non-successful and non-pending status (e.g. failed, cancelled, expired)
+          await supabase
+            .from("wallet_transactions")
+            .update({ status: "failed" })
+            .eq("id", txRow.id)
+            .eq("status", "pending");
+          reconciledCount++;
+        } else if (ageMs > 15 * 60 * 1000) {
+          // If transaction has been pending for over 15 minutes without success, mark as failed/cancelled
           await supabase
             .from("wallet_transactions")
             .update({ status: "failed" })
@@ -652,8 +663,9 @@ async function reconcilePendingTopups() {
         }
       } catch (itemErr) {
         const ageMs = Date.now() - new Date(txRow.created_at).getTime();
-        const IS_OLDER_THAN_24H = ageMs > 24 * 60 * 60 * 1000;
-        if (itemErr.response?.status === 404 && IS_OLDER_THAN_24H) {
+        // If Flutterwave returns 404 (no transaction found for tx_ref) and topup is older than 10 minutes,
+        // mark as failed (cancelled) instead of keeping pending forever.
+        if (itemErr.response?.status === 404 && ageMs > 10 * 60 * 1000) {
           await supabase
             .from("wallet_transactions")
             .update({ status: "failed" })
@@ -754,12 +766,23 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
       }
     } catch (fwErr) {
       console.error("Flutterwave verify call failed:", fwErr.message);
+      const ageMs = Date.now() - new Date(txRow.created_at).getTime();
+      if (fwErr.response?.status === 404 && ageMs > 10 * 60 * 1000) {
+        await supabase
+          .from("wallet_transactions")
+          .update({ status: "failed" })
+          .eq("id", txRow.id)
+          .eq("status", "pending");
+        return res.json({ status: "failed" });
+      }
       // Don't error out — fall through and return pending so the frontend can retry
       return res.json({
         status: "pending",
         message: "Payment gateway unreachable, please wait",
       });
     }
+
+    const ageMs = Date.now() - new Date(txRow.created_at).getTime();
 
     if (fwStatus === "successful") {
       const result = await completeTopupTransaction(
@@ -779,7 +802,7 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
       });
     }
 
-    if (fwStatus === "failed" || fwStatus === "cancelled") {
+    if ((fwStatus && fwStatus !== "pending") || ageMs > 15 * 60 * 1000) {
       await supabase
         .from("wallet_transactions")
         .update({ status: "failed" })
