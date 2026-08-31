@@ -5,7 +5,10 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { calculatePaymentProcessingFee, roundToTwoDecimals } from "./feeCalculator.js";
+import {
+  calculatePaymentProcessingFee,
+  roundToTwoDecimals,
+} from "./feeCalculator.js";
 
 dotenv.config();
 
@@ -509,7 +512,7 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
           .from("wallet_transactions")
           .select("*")
           .eq("reference", tx_ref)
-          .eq("status", "pending")
+          .in("status", ["pending", "partial"])
           .maybeSingle();
 
         if (lookupErr) {
@@ -517,7 +520,10 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
         } else if (txRow) {
           if (verifyStatus === "successful") {
             await completeTopupTransaction(txRow, verifyData);
-          } else if (verifyStatus === "failed" || verifyStatus === "cancelled") {
+          } else if (
+            verifyStatus === "failed" ||
+            verifyStatus === "cancelled"
+          ) {
             const { error: updateErr } = await supabase
               .from("wallet_transactions")
               .update({ status: "failed" })
@@ -551,8 +557,53 @@ async function completeTopupTransaction(txRow, verifyData = null) {
     return { status: "failed", already_failed: true };
   }
 
+  // ── Amount / currency guard ────────────────────────────────────────────
+  // Flutterwave can return status "successful" for a bank-transfer charge
+  // even when the amount actually received is LESS than what was requested
+  // — this is documented, expected behaviour on their side, not a bug.
+  // See: https://developer.flutterwave.com/v3.0/docs/transaction-verification
+  // Never credit the user's requested amount without checking what
+  // Flutterwave actually confirms was charged/received.
+  const expectedAmount = Number(txRow.gross_amount || txRow.amount || 0);
+  const confirmedAmount = Number(
+    verifyData?.charged_amount ?? verifyData?.amount ?? 0,
+  );
+  const confirmedCurrency = verifyData?.currency;
+
+  if (confirmedCurrency && confirmedCurrency !== "NGN") {
+    console.error(
+      `Topup ${txRow.id}: currency mismatch — expected NGN, got ${confirmedCurrency}. Leaving unresolved for manual review.`,
+    );
+    return { status: "currency_mismatch", success: false };
+  }
+
+  if (confirmedAmount + 0.01 < expectedAmount) {
+    // Underpayment — do NOT credit the wallet. Record what actually came in
+    // and flag it distinctly, rather than silently staying "pending"
+    // forever or crediting the full requested amount.
+    const { error: partialErr } = await supabase
+      .from("wallet_transactions")
+      .update({
+        status: "partial",
+        amount_received: confirmedAmount,
+      })
+      .eq("id", txRow.id)
+      .in("status", ["pending", "partial"]);
+
+    if (partialErr) {
+      console.error("Partial topup update error:", partialErr);
+      return { success: false, error: partialErr.message };
+    }
+
+    console.warn(
+      `Topup ${txRow.id}: underpayment detected — expected ${expectedAmount}, received ${confirmedAmount}. Wallet NOT credited.`,
+    );
+    return { status: "partial", expectedAmount, confirmedAmount };
+  }
+
   const actualGatewayFee = verifyData?.app_fee ?? verifyData?.fee ?? null;
-  const amountSettled = verifyData?.amount_settled ?? verifyData?.settled_amount ?? null;
+  const amountSettled =
+    verifyData?.amount_settled ?? verifyData?.settled_amount ?? null;
   const grossAmount = Number(txRow.gross_amount || txRow.amount || 0);
   const feeBreakdown = calculatePaymentProcessingFee(
     grossAmount,
@@ -612,13 +663,59 @@ async function completeTopupTransaction(txRow, verifyData = null) {
 }
 
 /**
- * Server-side Background Topup Reconciliation Helper.
- * Periodically queries Flutterwave for all pending wallet top-up transactions
- * and updates their status in Supabase if completed or failed on Flutterwave.
- * Also audits completed top-ups to ensure fee accounting correctly reflects VAT.
+ * On-demand Topup Reconciliation Helper.
+ *
+ * NOTE: this server runs on a serverless platform, so there is no
+ * persistent process for setInterval()/setTimeout() to run in — each
+ * invocation is a fresh, short-lived instance, so a background timer
+ * either never fires or fires unreliably. Instead, this function is
+ * invoked opportunistically whenever a human actually looks at topup
+ * data:
+ *   - the admin dashboard triggers it (throttled) on every load
+ *   - a user's own pending/partial rows get individually re-verified
+ *     by /api/wallet/topup/verify whenever they view their wallet
+ *     (see the WalletPage polling loop on the frontend)
+ *
+ * `throttleMs` guards against re-running this full sweep (which calls
+ * out to Flutterwave once per pending row) on every single page load —
+ * across concurrent serverless invocations it only actually runs at
+ * most once per `throttleMs`, tracked in the `reconciliation_state`
+ * table. Pass `force: true` to bypass the throttle (used by the manual
+ * "Sync & Reconcile" admin button).
+ *
+ * For transactions nobody ever revisits (user closes the tab and never
+ * comes back, admin never opens the dashboard), this on-demand approach
+ * alone won't catch them. Point an external scheduler — Vercel Cron,
+ * Supabase pg_cron, or any hosted cron — at POST /api/admin/topups/reconcile
+ * every few minutes as a backstop; serverless just can't schedule its own.
  */
-async function reconcilePendingTopups() {
+async function reconcilePendingTopups({
+  force = false,
+  throttleMs = 60 * 1000,
+} = {}) {
   if (!FLUTTERWAVE_SECRET_KEY) return { reconciled: 0, errors: 0 };
+
+  if (!force) {
+    const { data: state } = await supabase
+      .from("reconciliation_state")
+      .select("last_run_at")
+      .eq("id", "topup_reconcile")
+      .maybeSingle();
+
+    if (state) {
+      const sinceLastRun = Date.now() - new Date(state.last_run_at).getTime();
+      if (sinceLastRun < throttleMs) {
+        return { skipped: true, reason: "throttled" };
+      }
+    }
+  }
+
+  // Claim this run immediately (before doing any work) so concurrent
+  // serverless invocations don't all pile in and hammer Flutterwave.
+  await supabase.from("reconciliation_state").upsert({
+    id: "topup_reconcile",
+    last_run_at: new Date().toISOString(),
+  });
 
   try {
     // 1. Reconcile pending topups
@@ -737,24 +834,32 @@ async function reconcilePendingTopups() {
     }
 
     if (reconciledCount > 0) {
-      console.log(`Topup reconciliation: auto-reconciled ${reconciledCount} pending topups.`);
+      console.log(
+        `Topup reconciliation: auto-reconciled ${reconciledCount} pending topups.`,
+      );
     }
-    return { reconciled: reconciledCount, errors: errorCount, total: pendingTxns.length };
+    return {
+      reconciled: reconciledCount,
+      errors: errorCount,
+      total: pendingTxns.length,
+    };
   } catch (err) {
     console.error("Topup background reconciliation error:", err.message);
     return { reconciled: 0, errors: 1 };
   }
 }
 
-// Start periodic background topup reconciliation every 3 minutes
-setInterval(() => {
-  void reconcilePendingTopups();
-}, 3 * 60 * 1000);
-
-// Run initial reconciliation 10 seconds after server startup
-setTimeout(() => {
-  void reconcilePendingTopups();
-}, 10 * 1000);
+// Reconciliation now runs on-demand — see reconcilePendingTopups() above
+// for why setInterval/setTimeout were removed (serverless has no
+// persistent process for them to run in). It's triggered by:
+//   1. GET /api/admin/topups/reconcile-status (below) — auto-fired,
+//      throttled, whenever the admin dashboard loads
+//   2. POST /api/admin/topups/reconcile (below) — manual admin button,
+//      force: true, bypasses the throttle
+//   3. POST /api/wallet/topup/verify — re-checks that specific user's
+//      row every time they view their wallet page
+// Point an external scheduler (Vercel Cron / Supabase pg_cron / etc.)
+// at #2 on a fixed schedule to catch transactions nobody ever revisits.
 
 /**
  * POST /api/wallet/topup/verify
@@ -801,6 +906,14 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
       return res.json({ status: "failed" });
     }
 
+    if (txRow.status === "partial") {
+      return res.json({
+        status: "partial",
+        amount_expected: txRow.gross_amount ?? txRow.amount,
+        amount_received: txRow.amount_received,
+      });
+    }
+
     // Query Flutterwave by tx_ref using the dedicated verify_by_reference endpoint
     let fwStatus = null;
     let verifyData = null;
@@ -843,10 +956,7 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
     const ageMs = Date.now() - new Date(txRow.created_at).getTime();
 
     if (fwStatus === "successful") {
-      const result = await completeTopupTransaction(
-        txRow,
-        verifyData,
-      );
+      const result = await completeTopupTransaction(txRow, verifyData);
 
       if (result.error) {
         return res
@@ -877,9 +987,30 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
   }
 });
 
-// POST /api/admin/topups/reconcile — Admin manual reconciliation of all pending top-ups
+// POST /api/admin/topups/reconcile — Admin manual reconciliation ("Sync &
+// Reconcile Statuses" button). Always forces a real sweep, ignoring the
+// throttle, since the admin explicitly asked for a fresh check.
 app.post(
   "/api/admin/topups/reconcile",
+  authenticateRequest,
+  requireAdmin,
+  async (_req, res) => {
+    try {
+      const stats = await reconcilePendingTopups({ force: true });
+      return res.json({ ok: true, stats });
+    } catch (err) {
+      console.error("Admin topup reconcile error:", err);
+      return res.status(500).json({ error: "Failed to reconcile top-ups" });
+    }
+  },
+);
+
+// GET /api/admin/topups/reconcile-status — fired automatically by the admin
+// dashboard on every load (not just the manual button), so stale pending
+// rows get cleared up just by an admin looking at the page. Throttled to
+// once a minute internally, so it's cheap to call on every page view.
+app.get(
+  "/api/admin/topups/reconcile-status",
   authenticateRequest,
   requireAdmin,
   async (_req, res) => {
@@ -887,8 +1018,9 @@ app.post(
       const stats = await reconcilePendingTopups();
       return res.json({ ok: true, stats });
     } catch (err) {
-      console.error("Admin topup reconcile error:", err);
-      return res.status(500).json({ error: "Failed to reconcile top-ups" });
+      console.error("Admin topup auto-reconcile error:", err);
+      // Non-critical — the dashboard just shows whatever's already in the DB
+      return res.json({ ok: false });
     }
   },
 );
@@ -985,11 +1117,9 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
       console.error(
         "Bank resolve rejected: FLUTTERWAVE_SECRET_KEY not configured",
       );
-      return res
-        .status(503)
-        .json({
-          error: "Payment gateway not configured — cannot verify account",
-        });
+      return res.status(503).json({
+        error: "Payment gateway not configured — cannot verify account",
+      });
     }
 
     try {
@@ -1213,16 +1343,18 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       const payRef = "quizpay_" + crypto.randomUUID();
       const paymentTxnId = "wtx_" + crypto.randomUUID();
 
-      const { error: payErr } = await supabase.from("wallet_transactions").insert({
-        id: paymentTxnId,
-        user_id: req.user.id,
-        amount: -priceNaira,
-        type: "quiz_payment",
-        status: "completed",
-        reference: payRef,
-        related_quiz_id: quiz.id,
-        related_attempt_id: attemptId,
-      });
+      const { error: payErr } = await supabase
+        .from("wallet_transactions")
+        .insert({
+          id: paymentTxnId,
+          user_id: req.user.id,
+          amount: -priceNaira,
+          type: "quiz_payment",
+          status: "completed",
+          reference: payRef,
+          related_quiz_id: quiz.id,
+          related_attempt_id: attemptId,
+        });
 
       if (payErr) {
         // 23505 = unique_violation on the partial unique index added in
@@ -2398,18 +2530,30 @@ app.get(
         .select("*", { count: "exact" })
         .order("created_at", { ascending: false });
 
-      if (role === "users") profilesQuery = profilesQuery.eq("role", "user").eq("is_suspended", false);
-      else if (role === "creators") profilesQuery = profilesQuery.eq("role", "creator");
-      else if (role === "admins") profilesQuery = profilesQuery.eq("role", "admin");
-      else if (role === "suspended") profilesQuery = profilesQuery.eq("is_suspended", true);
-      if (universityId !== "all") profilesQuery = profilesQuery.eq("university_id", universityId);
-      if (search) profilesQuery = profilesQuery.ilike("full_name", `%${search.replace(/[%,]/g, "")}%`);
+      if (role === "users")
+        profilesQuery = profilesQuery
+          .eq("role", "user")
+          .eq("is_suspended", false);
+      else if (role === "creators")
+        profilesQuery = profilesQuery.eq("role", "creator");
+      else if (role === "admins")
+        profilesQuery = profilesQuery.eq("role", "admin");
+      else if (role === "suspended")
+        profilesQuery = profilesQuery.eq("is_suspended", true);
+      if (universityId !== "all")
+        profilesQuery = profilesQuery.eq("university_id", universityId);
+      if (search)
+        profilesQuery = profilesQuery.ilike(
+          "full_name",
+          `%${search.replace(/[%,]/g, "")}%`,
+        );
 
       const start = (page - 1) * pageSize;
-      const { data: profiles, count, error: profErr } = await profilesQuery.range(
-        start,
-        start + pageSize - 1,
-      );
+      const {
+        data: profiles,
+        count,
+        error: profErr,
+      } = await profilesQuery.range(start, start + pageSize - 1);
       if (profErr)
         return res.status(500).json({ error: "Failed to fetch profiles" });
 
