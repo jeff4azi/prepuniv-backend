@@ -5,10 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import {
-  calculatePaymentProcessingFee,
-  roundToTwoDecimals,
-} from "./feeCalculator.js";
+import { calculatePaymentProcessingFee, roundToTwoDecimals } from "./feeCalculator.js";
 
 dotenv.config();
 
@@ -520,10 +517,7 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
         } else if (txRow) {
           if (verifyStatus === "successful") {
             await completeTopupTransaction(txRow, verifyData);
-          } else if (
-            verifyStatus === "failed" ||
-            verifyStatus === "cancelled"
-          ) {
+          } else if (verifyStatus === "failed" || verifyStatus === "cancelled") {
             const { error: updateErr } = await supabase
               .from("wallet_transactions")
               .update({ status: "failed" })
@@ -602,8 +596,7 @@ async function completeTopupTransaction(txRow, verifyData = null) {
   }
 
   const actualGatewayFee = verifyData?.app_fee ?? verifyData?.fee ?? null;
-  const amountSettled =
-    verifyData?.amount_settled ?? verifyData?.settled_amount ?? null;
+  const amountSettled = verifyData?.amount_settled ?? verifyData?.settled_amount ?? null;
   const grossAmount = Number(txRow.gross_amount || txRow.amount || 0);
   const feeBreakdown = calculatePaymentProcessingFee(
     grossAmount,
@@ -660,6 +653,88 @@ async function completeTopupTransaction(txRow, verifyData = null) {
     already_completed: !updatedTx,
     tx: updatedTx || txRow,
   };
+}
+
+// How long a topup is allowed to sit "pending" before we stop waiting on
+// Flutterwave and just call it dead. Applies unconditionally — see below.
+const TOPUP_STALE_MS = 20 * 60 * 1000; // 20 minutes
+
+/**
+ * Resolves ONE pending/partial topup row against Flutterwave.
+ *
+ * The timestamp-based staleness check (`created_at` vs now) is the primary
+ * safety net and is UNCONDITIONAL: it applies no matter what happened with
+ * the Flutterwave call — whether it explicitly said "pending", returned
+ * something we didn't recognize, or threw an error of any kind (timeout,
+ * 404, 500, rate limit, a malformed reference on an old test row, etc).
+ *
+ * The previous version of this logic only had a staleness fallback for one
+ * narrow case (a 404 specifically, and only after 10 minutes) buried inside
+ * a catch block. Any other kind of Flutterwave error — which is exactly
+ * what tends to happen on old/abandoned references — fell through a
+ * different code path that returned "pending" unconditionally and never
+ * looked at the age at all. That's why rows sat pending for days even after
+ * clicking "Sync & Reconcile": the age check was never being reached.
+ *
+ * This function is now the single place that talks to Flutterwave for a
+ * pending topup, used by both the admin reconcile sweep and the user-facing
+ * /api/wallet/topup/verify endpoint, so the two can't drift out of sync
+ * with each other again.
+ */
+async function resolveTopupAgainstFlutterwave(txRow) {
+  const ageMs = Date.now() - new Date(txRow.created_at).getTime();
+  const tx_ref = txRow.reference;
+
+  let fwStatus = null;
+  let verifyData = null;
+
+  if (tx_ref) {
+    try {
+      const verifyRefResp = await flutterwaveAxios.get(
+        "/transactions/verify_by_reference",
+        { params: { tx_ref } },
+      );
+      const verifyRefData = verifyRefResp.data?.data;
+      const txId = verifyRefData?.id;
+
+      if (txId) {
+        const verifyResp = await flutterwaveAxios.get(
+          `/transactions/${txId}/verify`,
+        );
+        verifyData = verifyResp.data?.data;
+        fwStatus = verifyData?.status;
+      } else {
+        verifyData = verifyRefData;
+        fwStatus = verifyRefData?.status;
+      }
+    } catch (err) {
+      // Deliberately not branching on err.response?.status here — ANY
+      // failure to get a definitive answer from Flutterwave falls through
+      // to the unconditional age check below, not just 404s.
+      console.error(
+        `Topup resolve: Flutterwave verify failed for ${tx_ref}:`,
+        err.message,
+      );
+    }
+  }
+
+  if (fwStatus === "successful") {
+    return { outcome: "completed", verifyData };
+  }
+
+  if (fwStatus && fwStatus !== "pending") {
+    // Flutterwave gave us an explicit terminal status that isn't
+    // "successful" (e.g. cancelled, failed).
+    return { outcome: "failed", verifyData };
+  }
+
+  // fwStatus is null (verify call errored or returned nothing usable) or
+  // literally "pending" — either way, check the clock.
+  if (ageMs > TOPUP_STALE_MS) {
+    return { outcome: "stale", verifyData };
+  }
+
+  return { outcome: "pending", verifyData };
 }
 
 /**
@@ -731,44 +806,17 @@ async function reconcilePendingTopups({
 
     if (!error && pendingTxns && pendingTxns.length > 0) {
       for (const txRow of pendingTxns) {
+        if (!txRow.reference) continue;
         try {
-          const tx_ref = txRow.reference;
-          if (!tx_ref) continue;
+          const { outcome, verifyData } =
+            await resolveTopupAgainstFlutterwave(txRow);
 
-          let fwStatus = null;
-          let verifyData = null;
-
-          const verifyRefResp = await flutterwaveAxios.get(
-            "/transactions/verify_by_reference",
-            { params: { tx_ref } },
-          );
-          const verifyRefData = verifyRefResp.data?.data;
-          const txId = verifyRefData?.id;
-
-          if (txId) {
-            const verifyResp = await flutterwaveAxios.get(
-              `/transactions/${txId}/verify`,
-            );
-            verifyData = verifyResp.data?.data;
-            fwStatus = verifyData?.status;
-          } else {
-            verifyData = verifyRefData;
-            fwStatus = verifyRefData?.status;
-          }
-
-          const ageMs = Date.now() - new Date(txRow.created_at).getTime();
-
-          if (fwStatus === "successful") {
+          if (outcome === "completed") {
             const res = await completeTopupTransaction(txRow, verifyData);
-            if (res.status === "completed") reconciledCount++;
-          } else if (fwStatus && fwStatus !== "pending") {
-            await supabase
-              .from("wallet_transactions")
-              .update({ status: "failed" })
-              .eq("id", txRow.id)
-              .eq("status", "pending");
-            reconciledCount++;
-          } else if (ageMs > 15 * 60 * 1000) {
+            if (res.status === "completed" || res.status === "partial") {
+              reconciledCount++;
+            }
+          } else if (outcome === "failed" || outcome === "stale") {
             await supabase
               .from("wallet_transactions")
               .update({ status: "failed" })
@@ -776,18 +824,19 @@ async function reconcilePendingTopups({
               .eq("status", "pending");
             reconciledCount++;
           }
+          // outcome === "pending": still within the staleness window with
+          // no definitive answer from Flutterwave — leave it alone, we'll
+          // check again next sweep.
         } catch (itemErr) {
-          const ageMs = Date.now() - new Date(txRow.created_at).getTime();
-          if (itemErr.response?.status === 404 && ageMs > 10 * 60 * 1000) {
-            await supabase
-              .from("wallet_transactions")
-              .update({ status: "failed" })
-              .eq("id", txRow.id)
-              .eq("status", "pending");
-            reconciledCount++;
-          } else {
-            errorCount++;
-          }
+          // Only unexpected errors from our own DB writes land here now —
+          // resolveTopupAgainstFlutterwave() already swallows and reports
+          // Flutterwave-side failures internally, so this being reached
+          // doesn't mean the row gets stuck: it'll be retried next sweep.
+          console.error(
+            `Reconcile: unexpected error for ${txRow.reference}:`,
+            itemErr,
+          );
+          errorCount++;
         }
       }
     }
@@ -834,15 +883,9 @@ async function reconcilePendingTopups({
     }
 
     if (reconciledCount > 0) {
-      console.log(
-        `Topup reconciliation: auto-reconciled ${reconciledCount} pending topups.`,
-      );
+      console.log(`Topup reconciliation: auto-reconciled ${reconciledCount} pending topups.`);
     }
-    return {
-      reconciled: reconciledCount,
-      errors: errorCount,
-      total: pendingTxns.length,
-    };
+    return { reconciled: reconciledCount, errors: errorCount, total: pendingTxns.length };
   } catch (err) {
     console.error("Topup background reconciliation error:", err.message);
     return { reconciled: 0, errors: 1 };
@@ -914,48 +957,9 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
       });
     }
 
-    // Query Flutterwave by tx_ref using the dedicated verify_by_reference endpoint
-    let fwStatus = null;
-    let verifyData = null;
-    try {
-      const verifyRefResp = await flutterwaveAxios.get(
-        "/transactions/verify_by_reference",
-        { params: { tx_ref } },
-      );
-      const verifyRefData = verifyRefResp.data?.data;
-      const txId = verifyRefData?.id;
+    const { outcome, verifyData } = await resolveTopupAgainstFlutterwave(txRow);
 
-      if (txId) {
-        const verifyResp = await flutterwaveAxios.get(
-          `/transactions/${txId}/verify`,
-        );
-        verifyData = verifyResp.data?.data;
-        fwStatus = verifyData?.status;
-      } else {
-        verifyData = verifyRefData;
-        fwStatus = verifyRefData?.status;
-      }
-    } catch (fwErr) {
-      console.error("Flutterwave verify call failed:", fwErr.message);
-      const ageMs = Date.now() - new Date(txRow.created_at).getTime();
-      if (fwErr.response?.status === 404 && ageMs > 10 * 60 * 1000) {
-        await supabase
-          .from("wallet_transactions")
-          .update({ status: "failed" })
-          .eq("id", txRow.id)
-          .eq("status", "pending");
-        return res.json({ status: "failed" });
-      }
-      // Don't error out — fall through and return pending so the frontend can retry
-      return res.json({
-        status: "pending",
-        message: "Payment gateway unreachable, please wait",
-      });
-    }
-
-    const ageMs = Date.now() - new Date(txRow.created_at).getTime();
-
-    if (fwStatus === "successful") {
+    if (outcome === "completed") {
       const result = await completeTopupTransaction(txRow, verifyData);
 
       if (result.error) {
@@ -964,13 +968,33 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
           .json({ error: "Failed to update transaction status" });
       }
 
+      // completeTopupTransaction() itself may decide this is actually an
+      // underpayment (see the amount guard inside it) even though
+      // Flutterwave reported "successful" — don't report "completed" to
+      // the client in that case, or the UI shows success on a wallet that
+      // was never credited.
+      if (result.status === "partial") {
+        return res.json({
+          status: "partial",
+          amount_expected: result.expectedAmount,
+          amount_received: result.confirmedAmount,
+        });
+      }
+
+      if (result.status === "currency_mismatch") {
+        return res.json({
+          status: "pending",
+          message: "Under manual review",
+        });
+      }
+
       return res.json({
         status: "completed",
         already_completed: !!result.already_completed,
       });
     }
 
-    if ((fwStatus && fwStatus !== "pending") || ageMs > 15 * 60 * 1000) {
+    if (outcome === "failed" || outcome === "stale") {
       await supabase
         .from("wallet_transactions")
         .update({ status: "failed" })
@@ -979,7 +1003,9 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
 
       return res.json({ status: "failed" });
     }
-    // Still processing on Flutterwave's end
+
+    // outcome === "pending": still within the staleness window with no
+    // definitive answer from Flutterwave yet.
     return res.json({ status: "pending" });
   } catch (err) {
     console.error("Topup verify error:", err);
@@ -1117,9 +1143,11 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
       console.error(
         "Bank resolve rejected: FLUTTERWAVE_SECRET_KEY not configured",
       );
-      return res.status(503).json({
-        error: "Payment gateway not configured — cannot verify account",
-      });
+      return res
+        .status(503)
+        .json({
+          error: "Payment gateway not configured — cannot verify account",
+        });
     }
 
     try {
@@ -1343,18 +1371,16 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       const payRef = "quizpay_" + crypto.randomUUID();
       const paymentTxnId = "wtx_" + crypto.randomUUID();
 
-      const { error: payErr } = await supabase
-        .from("wallet_transactions")
-        .insert({
-          id: paymentTxnId,
-          user_id: req.user.id,
-          amount: -priceNaira,
-          type: "quiz_payment",
-          status: "completed",
-          reference: payRef,
-          related_quiz_id: quiz.id,
-          related_attempt_id: attemptId,
-        });
+      const { error: payErr } = await supabase.from("wallet_transactions").insert({
+        id: paymentTxnId,
+        user_id: req.user.id,
+        amount: -priceNaira,
+        type: "quiz_payment",
+        status: "completed",
+        reference: payRef,
+        related_quiz_id: quiz.id,
+        related_attempt_id: attemptId,
+      });
 
       if (payErr) {
         // 23505 = unique_violation on the partial unique index added in
@@ -2530,30 +2556,18 @@ app.get(
         .select("*", { count: "exact" })
         .order("created_at", { ascending: false });
 
-      if (role === "users")
-        profilesQuery = profilesQuery
-          .eq("role", "user")
-          .eq("is_suspended", false);
-      else if (role === "creators")
-        profilesQuery = profilesQuery.eq("role", "creator");
-      else if (role === "admins")
-        profilesQuery = profilesQuery.eq("role", "admin");
-      else if (role === "suspended")
-        profilesQuery = profilesQuery.eq("is_suspended", true);
-      if (universityId !== "all")
-        profilesQuery = profilesQuery.eq("university_id", universityId);
-      if (search)
-        profilesQuery = profilesQuery.ilike(
-          "full_name",
-          `%${search.replace(/[%,]/g, "")}%`,
-        );
+      if (role === "users") profilesQuery = profilesQuery.eq("role", "user").eq("is_suspended", false);
+      else if (role === "creators") profilesQuery = profilesQuery.eq("role", "creator");
+      else if (role === "admins") profilesQuery = profilesQuery.eq("role", "admin");
+      else if (role === "suspended") profilesQuery = profilesQuery.eq("is_suspended", true);
+      if (universityId !== "all") profilesQuery = profilesQuery.eq("university_id", universityId);
+      if (search) profilesQuery = profilesQuery.ilike("full_name", `%${search.replace(/[%,]/g, "")}%`);
 
       const start = (page - 1) * pageSize;
-      const {
-        data: profiles,
-        count,
-        error: profErr,
-      } = await profilesQuery.range(start, start + pageSize - 1);
+      const { data: profiles, count, error: profErr } = await profilesQuery.range(
+        start,
+        start + pageSize - 1,
+      );
       if (profErr)
         return res.status(500).json({ error: "Failed to fetch profiles" });
 
