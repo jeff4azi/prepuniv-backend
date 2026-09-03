@@ -561,6 +561,77 @@ app.post(
   },
 );
 
+// GET /api/admin/notifications/broadcasts — list recent broadcasts
+app.get(
+  "/api/admin/notifications/broadcasts",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const limit = Math.min(parseInt(req.query.limit || "20", 10), 100);
+
+      const { data, error } = await supabase
+        .from("notification_broadcasts")
+        .select(`
+          id,
+          title,
+          target,
+          target_user_id,
+          total_recipients,
+          processed_count,
+          status,
+          created_at,
+          completed_at
+        `)
+        .order("created_at", { ascending: false })
+        .limit(limit);
+
+      if (error) {
+        console.error("broadcasts list query failed:", error.message);
+        return res.status(500).json({ error: "Failed to load broadcasts" });
+      }
+
+      // Collect target_user_ids for lookup
+      const targetUserIds = (data || [])
+        .filter((r) => r.target === "user" && r.target_user_id)
+        .map((r) => r.target_user_id);
+
+      let userNameMap = {};
+      if (targetUserIds.length > 0) {
+        const { data: profileRows } = await supabase
+          .from("profiles")
+          .select("id, full_name")
+          .in("id", targetUserIds);
+        if (profileRows) {
+          profileRows.forEach((p) => {
+            userNameMap[p.id] = p.full_name;
+          });
+        }
+      }
+
+      const broadcasts = (data || []).map((r) => ({
+        id: r.id,
+        title: r.title,
+        target: r.target,
+        target_user_name:
+          r.target === "user" && r.target_user_id
+            ? userNameMap[r.target_user_id] || null
+            : null,
+        total_recipients: r.total_recipients,
+        processed_count: r.processed_count,
+        status: r.status,
+        created_at: r.created_at,
+        completed_at: r.completed_at,
+      }));
+
+      return res.json({ broadcasts });
+    } catch (err) {
+      console.error("broadcasts list error:", err.message);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
 app.post(
   "/api/wallet/topup/initiate",
   authenticateRequest,
