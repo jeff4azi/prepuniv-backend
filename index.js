@@ -6,6 +6,7 @@ import crypto from "crypto";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { calculatePaymentProcessingFee, roundToTwoDecimals } from "./feeCalculator.js";
+import webpush from "web-push";
 
 dotenv.config();
 
@@ -23,11 +24,34 @@ if (!FLUTTERWAVE_WEBHOOK_SECRET) {
     "WARNING: FLUTTERWAVE_WEBHOOK_SECRET is not configured — webhook signature verification cannot proceed. Webhook calls will be rejected until this is set.",
   );
 }
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
+if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+  console.warn("WARNING: VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not configured — push notifications will be skipped.");
+}
+if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+  webpush.setVapidDetails(
+    "mailto:support@prepuniv.com",
+    VAPID_PUBLIC_KEY,
+    VAPID_PRIVATE_KEY
+  );
+}
+const PUSH_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
+
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
 const PORT = process.env.PORT || 5000;
 
 const MINIMUM_PAYOUT_THRESHOLD = 2000;
+
+const ALLOWED_NOTIFICATION_TYPES = new Set([
+  "topup_completed", "topup_partial", "topup_failed",
+  "quiz_purchase_confirmed", "admin_broadcast",
+  "payout_requested", "payout_paid", "payout_failed", "payout_reversed",
+  "new_report_on_quiz", "quiz_suspended",
+  "creator_application_approved", "creator_application_rejected",
+  "new_report_submitted", "new_creator_application", "payout_requested_pending_review",
+]);
 
 const app = express();
 
@@ -185,9 +209,357 @@ console.log(
     : "Creator transfer calls using direct connection (no FIXIE_URL set — set this before re-enabling Flutterwave IP whitelisting)",
 );
 
+// ─── Notifications + Web Push helpers ──────────────────────────────────────
+
+function validateNotificationType(type) {
+  if (!ALLOWED_NOTIFICATION_TYPES.has(type)) {
+    throw new Error(`Invalid notification type: ${type}`);
+  }
+  return type;
+}
+
+async function insertNotification({ userId, type, title, body, data = {}, createdBy = null }) {
+  try {
+    validateNotificationType(type);
+    const { error } = await supabase.from("notifications").insert({
+      user_id: userId,
+      type,
+      title,
+      body,
+      data,
+      created_by: createdBy,
+    });
+    if (error) {
+      console.error(`[notifications] insert failed for user=${userId} type=${type}:`, error.message);
+      return null;
+    }
+    return true;
+  } catch (err) {
+    console.error(`[notifications] insert error for user=${userId}:`, err.message);
+    return null;
+  }
+}
+
+async function sendPushToUser(userId, { title, body, data = {} }) {
+  if (!PUSH_ENABLED) return;
+  try {
+    const { data: subs, error } = await supabase
+      .from("push_subscriptions")
+      .select("*")
+      .eq("user_id", userId);
+    if (error || !subs || subs.length === 0) return;
+    await sendPushBatch(subs, { title, body, data });
+  } catch (err) {
+    console.error(`[push] sendPushToUser error for user=${userId}:`, err.message);
+  }
+}
+
+async function sendPushBatch(subscriptionRows, { title, body, data = {} }) {
+  if (!PUSH_ENABLED) return { sent: 0, failed: 0, pruned: 0 };
+  let sent = 0;
+  let failed = 0;
+  const toPrune = [];
+  const payload = JSON.stringify({ title, body, data });
+
+  for (const sub of subscriptionRows) {
+    if (!sub.endpoint || !sub.p256dh || !sub.auth) continue;
+    try {
+      await webpush.sendNotification(
+        {
+          endpoint: sub.endpoint,
+          keys: { p256dh: sub.p256dh, auth: sub.auth },
+        },
+        payload
+      );
+      sent++;
+      supabase
+        .from("push_subscriptions")
+        .update({ last_seen_at: new Date().toISOString() })
+        .eq("id", sub.id)
+        .catch((e) => console.warn("push_subscriptions last_seen update failed:", e.message));
+    } catch (err) {
+      const status = err?.statusCode;
+      if (status === 410 || status === 404) {
+        toPrune.push(sub.id);
+      } else {
+        failed++;
+        console.warn(`[push] send failed for endpoint=${sub.endpoint.slice(0,40)}...:`, err?.message || String(err));
+      }
+    }
+  }
+  if (toPrune.length) {
+    try {
+      await supabase.from("push_subscriptions").delete().in("id", toPrune);
+    } catch (e) {
+      console.error("[push] prune failed:", e.message);
+    }
+  }
+  return { sent, failed, pruned: toPrune.length };
+}
+
+async function processBroadcastBatch(broadcastId, batchSize = 200) {
+  const { data: bc, error: bcErr } = await supabase
+    .from("notification_broadcasts")
+    .update({ status: "processing" })
+    .eq("id", broadcastId)
+    .in("status", ["pending", "processing"])
+    .select()
+    .maybeSingle();
+  if (bcErr || !bc) return { error: bcErr?.message || "broadcast not found" };
+
+  try {
+    const cursor = bc.last_processed_user_id;
+    let query = supabase.from("profiles").select("id").order("id", { ascending: true }).limit(batchSize);
+    if (bc.target === "user" && bc.target_user_id) {
+      query = query.eq("id", bc.target_user_id);
+    } else if (cursor) {
+      query = query.gt("id", cursor);
+    }
+
+    let processedInThisBatch = 0;
+    const { data: users, error: usersErr } = await query;
+    if (usersErr) throw usersErr;
+    if (!users || users.length === 0) {
+      await supabase.from("notification_broadcasts").update({
+        status: "done",
+        completed_at: new Date().toISOString(),
+      }).eq("id", broadcastId);
+      return { done: true, total_processed: bc.processed_count };
+    }
+
+    const userIds = users.map((u) => u.id);
+    const notifRows = userIds.map((uid) => ({
+      user_id: uid,
+      type: "admin_broadcast",
+      title: bc.title,
+      body: bc.body,
+      data: bc.data,
+      created_by: bc.created_by,
+    }));
+    const { error: notifErr } = await supabase.from("notifications").insert(notifRows);
+    if (notifErr) console.error("[broadcast] notifications insert failed:", notifErr.message);
+
+    try {
+      const { data: subs } = await supabase
+        .from("push_subscriptions")
+        .select("*")
+        .in("user_id", userIds);
+      if (subs && subs.length) {
+        await sendPushBatch(subs, { title: bc.title, body: bc.body, data: bc.data });
+      }
+    } catch (pushErr) {
+      console.error("[broadcast] push send failed:", pushErr.message);
+    }
+
+    processedInThisBatch = userIds.length;
+    const newProcessedCount = (bc.processed_count || 0) + processedInThisBatch;
+    const lastUserId = bc.target === "user" ? null : users[users.length - 1].id;
+    const isDone = bc.target === "user" || processedInThisBatch < batchSize;
+
+    const finalTotal = bc.total_recipients || 0;
+    const { error: updErr } = await supabase
+      .from("notification_broadcasts")
+      .update({
+        processed_count: newProcessedCount,
+        last_processed_user_id: lastUserId,
+        total_recipients: finalTotal,
+        status: isDone ? "done" : "processing",
+        completed_at: isDone ? new Date().toISOString() : null,
+      })
+      .eq("id", broadcastId);
+    if (updErr) console.error("[broadcast] update failed:", updErr.message);
+
+    return {
+      done: isDone,
+      processed_count: newProcessedCount,
+      total_recipients: finalTotal,
+    };
+  } catch (err) {
+    console.error(`[broadcast] batch process failed for ${broadcastId}:`, err.message);
+    return { error: err.message };
+  }
+}
+
 app.get("/api/health", (req, res) => {
   res.json({ ok: true });
 });
+
+// ─── Push notification routes ────────────────────────────────────────────────────
+app.get("/api/push/vapid-public-key", (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.json({ enabled: false });
+  res.json({ enabled: true, publicKey: VAPID_PUBLIC_KEY });
+});
+
+app.get("/api/push/vapid-key", (req, res) => {
+  if (!VAPID_PUBLIC_KEY) return res.json({ enabled: false });
+  res.json({ enabled: true, public_key: VAPID_PUBLIC_KEY });
+});
+
+// POST /api/push/subscribe — user saves new push subscription for self
+app.post("/api/push/subscribe", authenticateRequest, async (req, res) => {
+  try {
+    const { endpoint, p256dh, auth } = req.body || {};
+    if (!endpoint || !p256dh || !auth) {
+      return res.status(400).json({ error: "endpoint, p256dh, auth are required" });
+    }
+    const ua = typeof req.headers["user-agent"] || null;
+    const now = new Date().toISOString();
+    const { data: existing } = await supabase
+      .from("push_subscriptions")
+      .select("id")
+      .eq("endpoint", endpoint)
+      .maybeSingle();
+    if (existing) {
+      await supabase.from("push_subscriptions")
+        .update({ user_agent: ua, last_seen_at: now })
+        .eq("id", existing.id);
+      return res.json({ ok: true, updated: true });
+    }
+    const { error } = await supabase.from("push_subscriptions").insert({
+      user_id: req.user.id, endpoint, p256dh, auth, user_agent: ua, last_seen_at: now,
+    });
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ ok: true, created: true });
+  } catch (err) {
+    console.error("[push] subscribe error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// DELETE /api/push/unsubscribe — user deletes their own push subscription
+app.delete("/api/push/unsubscribe", authenticateRequest, async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint) return res.status(400).json({ error: "endpoint required" });
+    await supabase.from("push_subscriptions")
+      .delete()
+      .eq("endpoint", endpoint)
+      .eq("user_id", req.user.id);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[push] unsubscribe error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// POST /api/push/unsubscribe — same as DELETE, alias for clients that don't support DELETE with body
+app.post("/api/push/unsubscribe", authenticateRequest, async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint) return res.status(400).json({ error: "endpoint required" });
+    await supabase.from("push_subscriptions")
+      .delete()
+      .eq("endpoint", endpoint)
+      .eq("user_id", req.user.id);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("[push] unsubscribe error:", err.message);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ── wrap helper that does BOTH DB insert + push send (for backend-originated notifications only)
+async function notifyUser(userId, { type, title, body, data = {}, createdBy = null }) {
+  await insertNotification({ userId, type, title, body, data, createdBy });
+  const ndata = (typeof data === "string" ? JSON.parse(data) : data);
+  await sendPushToUser(userId, { title, body, data: { ...ndata, url: ndata?.url } });
+}
+
+// ─── Admin broadcast routes ────────────────────────────────────────────────
+app.post(
+  "/api/admin/notifications/broadcast",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { title, body, data, target, targetUserId } = req.body || {};
+      if (!title || typeof title !== "string") {
+        return res.status(400).json({ error: "title is required" });
+      }
+      if (!target || !["all", "user"].includes(target)) {
+        return res.status(400).json({ error: "target must be 'all' or 'user'" });
+      }
+      if (target === "user" && !targetUserId) {
+        return res.status(400).json({ error: "targetUserId required for user target" });
+      }
+      // Compute total_recipients count
+      let total = 0;
+      if (target === "all") {
+        const { count, error: cntErr } = await supabase
+          .from("profiles")
+          .select("*", { count: "exact", head: true });
+        if (cntErr) console.warn("broadcast count warn:", cntErr.message);
+        total = count || 0;
+      } else {
+        total = 1;
+      }
+      const { data: bc, error: bcErr } = await supabase
+        .from("notification_broadcasts")
+        .insert({
+          title,
+          body: body || null,
+          data: data || {},
+          target,
+          target_user_id: target === "user" ? targetUserId : null,
+          created_by: req.user.id,
+          total_recipients: total,
+        })
+        .select()
+        .single();
+      if (bcErr) return res.status(500).json({ error: bcErr.message });
+      // Kick off first batch synchronously (serverless-safe — no background thread pool).
+      processBroadcastBatch(bc.id, 200).catch((e) => console.error("broadcast kickoff failed:", e?.message || e));
+      return res.status(202).json({ ok: true, broadcast: bc });
+    } catch (err) {
+      console.error("broadcast create error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+// GET /api/admin/notifications/broadcasts/:id — poll broadcast status
+app.get(
+  "/api/admin/notifications/broadcasts/:id",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { data: bc, error } = await supabase
+        .from("notification_broadcasts")
+        .select("*")
+        .eq("id", id)
+        .maybeSingle();
+      if (error) return res.status(500).json({ error: error.message });
+      if (!bc) return res.status(404).json({ error: "Broadcast not found" });
+      // serverless — re-trigger next batch if still processing/pending (idempotent kicker)
+      if (bc.status === "processing" || bc.status === "pending") {
+        processBroadcastBatch(bc.id, 200).catch((e) => console.warn("status poll kick error:", e?.message || e));
+      }
+      return res.json(bc);
+    } catch (err) {
+      console.error("broadcast status error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+// POST /api/admin/notifications/broadcasts/:id/continue — manually kick another batch
+app.post(
+  "/api/admin/notifications/broadcasts/:id/continue",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = await processBroadcastBatch(id, 200);
+      return res.json(result);
+    } catch (err) {
+      console.error("broadcast continue error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
 
 app.post(
   "/api/wallet/topup/initiate",
@@ -422,6 +794,12 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
 
         if (updErr) console.error("Payout paid update error:", updErr);
         console.log(`Payout ${payout.id} marked as PAID via transfer webhook`);
+        notifyUser(payout.creator_id, {
+          type: "payout_paid",
+          title: "Payout sent",
+          body: `Your ₦${Number(payout.amount).toLocaleString()} payout has been sent to your bank account.`,
+          data: { url: "/creator/payouts", payout_id: payout.id },
+        }).catch(() => {});
       } else if (statusUpper === "FAILED" || statusUpper === "REVERSED") {
         if (statusUpper === "FAILED") {
           await supabase
@@ -434,6 +812,12 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
           console.log(
             `Payout ${payout.id} marked as FAILED via transfer webhook`,
           );
+          notifyUser(payout.creator_id, {
+            type: "payout_failed",
+            title: "Payout failed",
+            body: `Your ₦${Number(payout.amount).toLocaleString()} payout failed: ${verifiedFailureMsg || "Transfer failed"}`,
+            data: { url: "/creator/payouts" },
+          }).catch(() => {});
         } else {
           // REVERSED — payout was previously paid but the bank reversed it
           // 1. Insert a compensating positive wallet_transactions (reversal)
@@ -469,6 +853,12 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
           console.log(
             `Payout ${payout.id} marked as REVERSED via transfer webhook — balance restored`,
           );
+          notifyUser(payout.creator_id, {
+            type: "payout_reversed",
+            title: "Payout reversed",
+            body: `Your ₦${Number(payout.amount).toLocaleString()} payout was reversed by the bank. The funds have been returned to your balance.`,
+            data: { url: "/creator/payouts" },
+          }).catch(() => {});
         }
       } else {
         // Any unknown status — log but leave at processing
@@ -525,6 +915,7 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
               .eq("status", "pending");
             if (updateErr)
               console.error("Webhook failed-update error:", updateErr);
+            notifyUser(txRow.user_id, { type: "topup_failed", title: "Top-up failed", body: "Your top-up could not be completed. Please try again or contact support.", data: { url: "/wallet" } }).catch(() => {});
           }
         }
       } catch (verifyErr) {
@@ -592,7 +983,14 @@ async function completeTopupTransaction(txRow, verifyData = null) {
     console.warn(
       `Topup ${txRow.id}: underpayment detected — expected ${expectedAmount}, received ${confirmedAmount}. Wallet NOT credited.`,
     );
-    return { status: "partial", expectedAmount, confirmedAmount };
+    const partRet = { status: "partial", expectedAmount, confirmedAmount };
+    notifyUser(txRow.user_id, {
+      type: "topup_partial",
+      title: "Top-up pending review",
+      body: `We received ₦${Number(confirmedAmount || 0).toLocaleString()} of the requested ₦${Number(expectedAmount || 0).toLocaleString()}. Your wallet will be credited once the difference is settled.`,
+      data: { url: "/wallet" },
+    }).catch(() => {});
+    return partRet;
   }
 
   const actualGatewayFee = verifyData?.app_fee ?? verifyData?.fee ?? null;
@@ -646,6 +1044,15 @@ async function completeTopupTransaction(txRow, verifyData = null) {
   if (updateErr) {
     console.error("Topup transaction completion update error:", updateErr);
     return { success: false, error: updateErr.message };
+  }
+
+  if (updatedTx) {
+    notifyUser(txRow.user_id, {
+      type: "topup_completed",
+      title: "Top-up successful",
+      body: `Your wallet has been credited with ₦${Number(txRow.amount || 0).toLocaleString()}.`,
+      data: { url: "/wallet", tx_ref: txRow.reference },
+    }).catch(() => {});
   }
 
   return {
@@ -822,6 +1229,7 @@ async function reconcilePendingTopups({
               .update({ status: "failed" })
               .eq("id", txRow.id)
               .eq("status", "pending");
+            notifyUser(txRow.user_id, { type: "topup_failed", title: "Top-up failed", body: "Your top-up could not be completed. Please try again or contact support.", data: { url: "/wallet" } }).catch(() => {});
             reconciledCount++;
           }
           // outcome === "pending": still within the staleness window with
@@ -1000,6 +1408,8 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
         .update({ status: "failed" })
         .eq("id", txRow.id)
         .eq("status", "pending");
+
+      notifyUser(txRow.user_id, { type: "topup_failed", title: "Top-up failed", body: "Your top-up could not be completed. Please try again or contact support.", data: { url: "/wallet" } }).catch(() => {});
 
       return res.json({ status: "failed" });
     }
@@ -1848,6 +2258,38 @@ app.post(
           .status(500)
           .json({ error: "Failed to create payout request" });
       }
+
+      notifyUser(req.user.id, {
+        type: "payout_requested",
+        title: "Payout request received",
+        body: `We've received your payout request of ₦${Number(inserted.amount).toLocaleString()}. We'll review it shortly.`,
+        data: { url: "/creator/payouts" },
+      }).catch(() => {});
+
+      try {
+        const { data: adminRows } = await supabase
+          .from("profiles")
+          .select("id")
+          .eq("role", "admin");
+        if (adminRows && adminRows.length > 0) {
+          const creatorName = profile.full_name || "A creator";
+          for (const admin of adminRows) {
+            insertNotification({
+              userId: admin.id,
+              type: "payout_requested_pending_review",
+              title: "New payout request",
+              body: `${creatorName} requested a payout of ₦${Number(inserted.amount).toLocaleString()}.`,
+              data: { url: "/admin/payouts" },
+              createdBy: req.user.id,
+            }).catch(() => {});
+            sendPushToUser(admin.id, {
+              title: "New payout request",
+              body: `${creatorName} requested a payout of ₦${Number(inserted.amount).toLocaleString()}.`,
+              data: { url: "/admin/payouts" },
+            }).catch(() => {});
+          }
+        }
+      } catch (_e) {}
 
       return res.json({
         id: inserted.id,

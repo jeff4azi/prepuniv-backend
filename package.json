@@ -20,7 +20,8 @@
     "express": "^5.2.1",
     "https-proxy-agent": "^9.1.0",
     "jsonwebtoken": "^9.0.3",
-    "jwks-rsa": "^4.1.0"
+    "jwks-rsa": "^4.1.0",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
