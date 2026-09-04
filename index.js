@@ -11,6 +11,10 @@ import {
 } from "./feeCalculator.js";
 import webpush from "web-push";
 import { createOgMiddleware } from "./ogMiddleware.js";
+import {
+  isQuizPubliclyVisible,
+  isCreatorPubliclyVisible,
+} from "./lib/publicVisibility.js";
 
 dotenv.config();
 
@@ -3657,6 +3661,195 @@ app.delete(
     }
   },
 );
+
+// app.listen is only used in local development.
+// On Vercel (serverless), the exported app is used directly as the handler.
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+// ─── Sitemap ──────────────────────────────────────────────────────────────────
+
+/**
+ * In-memory sitemap cache.
+ *
+ * Follows the same { data, cachedAt } pattern used elsewhere in this file.
+ * The generated XML is cached for SITEMAP_CACHE_TTL ms so repeated crawler
+ * hits (Googlebot often fetches sitemaps several times per crawl cycle) don't
+ * pound Supabase on every request.
+ *
+ * Serverless caveat: each Vercel invocation is a fresh process, so the cache
+ * is warm only within a single invocation's lifetime. In practice this is
+ * fine — Google's crawl rate is slow enough that a fresh query per cold-start
+ * is no problem.
+ */
+const SITEMAP_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+let sitemapCache = { xml: null, cachedAt: 0 };
+
+const SITE_BASE_URL = "https://www.prepuniv.com";
+
+/**
+ * Static pages to always include in the sitemap.
+ * These are the public, SEO-meaningful pages that require no DB query.
+ * Pages that require auth or have no standalone value are NOT listed here —
+ * they are covered by robots.txt Disallow rules instead.
+ */
+const STATIC_SITEMAP_PAGES = [
+  { loc: `${SITE_BASE_URL}/`, changefreq: "weekly", priority: "1.0" },
+  { loc: `${SITE_BASE_URL}/browse`, changefreq: "daily", priority: "0.9" },
+  { loc: `${SITE_BASE_URL}/login`, changefreq: "monthly", priority: "0.3" },
+  { loc: `${SITE_BASE_URL}/signup`, changefreq: "monthly", priority: "0.3" },
+  {
+    loc: `${SITE_BASE_URL}/apply-creator`,
+    changefreq: "monthly",
+    priority: "0.4",
+  },
+  { loc: `${SITE_BASE_URL}/terms`, changefreq: "monthly", priority: "0.2" },
+  { loc: `${SITE_BASE_URL}/privacy`, changefreq: "monthly", priority: "0.2" },
+];
+
+/** Escape special XML characters in attribute values and text content. */
+function escapeXml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/** Format a Date or ISO string as YYYY-MM-DD for <lastmod>. */
+function toDateStr(val) {
+  if (!val) return null;
+  const d = new Date(val);
+  if (isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Build and return the sitemap XML string.
+ *
+ * Filter conditions (must match publicVisibility.js — don't duplicate logic):
+ *   Quizzes:  isQuizPubliclyVisible  → is_published=true  AND unpublished_by_admin=false
+ *   Creators: isCreatorPubliclyVisible → is_approved_creator=true AND is_suspended=false
+ *
+ * The queries use explicit .eq() filters on the DB side so we don't pull down
+ * rows we'd just discard, and we select only the columns we actually use.
+ * A .limit(50000) guard is included as a safety net — the sitemap protocol
+ * caps a single file at 50,000 URLs. This app is nowhere near that today;
+ * when it approaches the limit, split into a sitemap index referencing
+ * separate sitemap-quizzes.xml and sitemap-creators.xml files.
+ */
+async function buildSitemapXml() {
+  // ── 1. Query publicly visible quizzes ────────────────────────────────────
+  const { data: quizzes, error: quizErr } = await supabase
+    .from("quizzes")
+    .select("id, updated_at, is_published, unpublished_by_admin")
+    .eq("is_published", true)
+    .eq("unpublished_by_admin", false)
+    .order("updated_at", { ascending: false })
+    .limit(50000);
+
+  if (quizErr) {
+    console.error("[sitemap] quizzes query failed:", quizErr.message);
+    throw quizErr;
+  }
+
+  // ── 2. Query publicly visible creator profiles ────────────────────────────
+  const { data: creators, error: creatorErr } = await supabase
+    .from("profiles")
+    .select("id, is_approved_creator, is_suspended")
+    .eq("is_approved_creator", true)
+    .eq("is_suspended", false)
+    .limit(50000);
+
+  if (creatorErr) {
+    console.error("[sitemap] profiles query failed:", creatorErr.message);
+    throw creatorErr;
+  }
+
+  // ── 3. Build XML ──────────────────────────────────────────────────────────
+  const lines = [];
+  lines.push(`<?xml version="1.0" encoding="UTF-8"?>`);
+  lines.push(`<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`);
+
+  // Static pages
+  for (const page of STATIC_SITEMAP_PAGES) {
+    lines.push(`  <url>`);
+    lines.push(`    <loc>${escapeXml(page.loc)}</loc>`);
+    lines.push(`    <changefreq>${page.changefreq}</changefreq>`);
+    lines.push(`    <priority>${page.priority}</priority>`);
+    lines.push(`  </url>`);
+  }
+
+  // Dynamic: quiz pages
+  // We already filtered server-side with .eq(), but run the helper as the
+  // final authority so the in-process logic and DB filters can't drift apart.
+  for (const quiz of quizzes || []) {
+    if (!isQuizPubliclyVisible(quiz)) continue; // belt-and-suspenders guard
+    const lastmod = toDateStr(quiz.updated_at);
+    lines.push(`  <url>`);
+    lines.push(
+      `    <loc>${escapeXml(`${SITE_BASE_URL}/quiz/${quiz.id}`)}</loc>`,
+    );
+    if (lastmod) lines.push(`    <lastmod>${lastmod}</lastmod>`);
+    lines.push(`    <changefreq>weekly</changefreq>`);
+    lines.push(`    <priority>0.8</priority>`);
+    lines.push(`  </url>`);
+  }
+
+  // Dynamic: creator profile pages
+  for (const creator of creators || []) {
+    if (!isCreatorPubliclyVisible(creator)) continue; // belt-and-suspenders guard
+    lines.push(`  <url>`);
+    lines.push(
+      `    <loc>${escapeXml(`${SITE_BASE_URL}/profile/creator/${creator.id}`)}</loc>`,
+    );
+    lines.push(`    <changefreq>weekly</changefreq>`);
+    lines.push(`    <priority>0.7</priority>`);
+    lines.push(`  </url>`);
+  }
+
+  lines.push(`</urlset>`);
+  return lines.join("\n");
+}
+
+/**
+ * GET /sitemap.xml
+ *
+ * Returns a dynamically generated sitemap covering all publicly visible
+ * quiz pages and approved/unsuspended creator profile pages, plus the
+ * static marketing pages.
+ *
+ * Cached for SITEMAP_CACHE_TTL (5 min) so crawler bursts don't saturate
+ * Supabase. Cache is module-level (warm within a serverless invocation).
+ */
+app.get("/sitemap.xml", async (req, res) => {
+  try {
+    const now = Date.now();
+    if (sitemapCache.xml && now - sitemapCache.cachedAt < SITEMAP_CACHE_TTL) {
+      res.setHeader("Content-Type", "application/xml; charset=utf-8");
+      res.setHeader("X-Sitemap-Cache", "HIT");
+      return res.send(sitemapCache.xml);
+    }
+
+    const xml = await buildSitemapXml();
+    sitemapCache = { xml, cachedAt: Date.now() };
+
+    res.setHeader("Content-Type", "application/xml; charset=utf-8");
+    res.setHeader("X-Sitemap-Cache", "MISS");
+    return res.send(xml);
+  } catch (err) {
+    console.error("[sitemap] generation failed:", err.message);
+    return res
+      .status(500)
+      .send(
+        '<?xml version="1.0"?><error>Sitemap temporarily unavailable</error>',
+      );
+  }
+});
 
 // app.listen is only used in local development.
 // On Vercel (serverless), the exported app is used directly as the handler.

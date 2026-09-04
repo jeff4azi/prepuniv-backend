@@ -57,6 +57,10 @@
 import { readFile } from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+  isQuizPubliclyVisible,
+  isCreatorPubliclyVisible,
+} from "./lib/publicVisibility.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -298,13 +302,16 @@ export function createOgMiddleware(supabase) {
         // ── Creator profile page ──────────────────────────────────────────
         const { data: profile } = await supabase
           .from("profiles")
-          .select("id, full_name, avatar_url, bio")
+          .select(
+            "id, full_name, avatar_url, bio, is_approved_creator, is_suspended",
+          )
           .eq("id", id)
           .in("role", ["creator", "admin"])
           .maybeSingle();
 
-        if (!profile) {
-          // Bad/deleted profile — fall through to default SPA
+        if (!profile || !isCreatorPubliclyVisible(profile)) {
+          // Bad/deleted profile, suspended creator, or unapproved application —
+          // fall through to default SPA
           return next();
         }
 
