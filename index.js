@@ -5,8 +5,12 @@ import { createClient } from "@supabase/supabase-js";
 import crypto from "crypto";
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { calculatePaymentProcessingFee, roundToTwoDecimals } from "./feeCalculator.js";
+import {
+  calculatePaymentProcessingFee,
+  roundToTwoDecimals,
+} from "./feeCalculator.js";
 import webpush from "web-push";
+import { createOgMiddleware } from "./ogMiddleware.js";
 
 dotenv.config();
 
@@ -27,13 +31,15 @@ if (!FLUTTERWAVE_WEBHOOK_SECRET) {
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
 if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
-  console.warn("WARNING: VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not configured — push notifications will be skipped.");
+  console.warn(
+    "WARNING: VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY not configured — push notifications will be skipped.",
+  );
 }
 if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
   webpush.setVapidDetails(
     "mailto:support@prepuniv.com",
     VAPID_PUBLIC_KEY,
-    VAPID_PRIVATE_KEY
+    VAPID_PRIVATE_KEY,
   );
 }
 const PUSH_ENABLED = !!(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
@@ -45,12 +51,22 @@ const PORT = process.env.PORT || 5000;
 const MINIMUM_PAYOUT_THRESHOLD = 2000;
 
 const ALLOWED_NOTIFICATION_TYPES = new Set([
-  "topup_completed", "topup_partial", "topup_failed",
-  "quiz_purchase_confirmed", "admin_broadcast",
-  "payout_requested", "payout_paid", "payout_failed", "payout_reversed",
-  "new_report_on_quiz", "quiz_suspended",
-  "creator_application_approved", "creator_application_rejected",
-  "new_report_submitted", "new_creator_application", "payout_requested_pending_review",
+  "topup_completed",
+  "topup_partial",
+  "topup_failed",
+  "quiz_purchase_confirmed",
+  "admin_broadcast",
+  "payout_requested",
+  "payout_paid",
+  "payout_failed",
+  "payout_reversed",
+  "new_report_on_quiz",
+  "quiz_suspended",
+  "creator_application_approved",
+  "creator_application_rejected",
+  "new_report_submitted",
+  "new_creator_application",
+  "payout_requested_pending_review",
 ]);
 
 const app = express();
@@ -97,6 +113,19 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     persistSession: false,
   },
 });
+
+// ─── OG meta tag middleware ────────────────────────────────────────────────────
+// Must be mounted BEFORE API routes and BEFORE any static-file / SPA-fallback
+// middleware. Intercepts GET /quiz/:id and GET /profile/creator/:id, injects
+// page-specific OG tags into the served HTML, then returns. All other requests
+// pass straight through to the next handler.
+//
+// See ogMiddleware.js for the important production deployment note: this only
+// works when the Express backend also serves the SPA's index.html. In the
+// current split-deployment setup (frontend on its own Vercel project) this is
+// active in local dev and any co-located deployment, but NOT for production
+// link previews without an infrastructure change. Read the note in that file.
+app.use(createOgMiddleware(supabase));
 
 const authenticateRequest = async (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -218,7 +247,14 @@ function validateNotificationType(type) {
   return type;
 }
 
-async function insertNotification({ userId, type, title, body, data = {}, createdBy = null }) {
+async function insertNotification({
+  userId,
+  type,
+  title,
+  body,
+  data = {},
+  createdBy = null,
+}) {
   try {
     validateNotificationType(type);
     const { error } = await supabase.from("notifications").insert({
@@ -230,12 +266,18 @@ async function insertNotification({ userId, type, title, body, data = {}, create
       created_by: createdBy,
     });
     if (error) {
-      console.error(`[notifications] insert failed for user=${userId} type=${type}:`, error.message);
+      console.error(
+        `[notifications] insert failed for user=${userId} type=${type}:`,
+        error.message,
+      );
       return null;
     }
     return true;
   } catch (err) {
-    console.error(`[notifications] insert error for user=${userId}:`, err.message);
+    console.error(
+      `[notifications] insert error for user=${userId}:`,
+      err.message,
+    );
     return null;
   }
 }
@@ -250,7 +292,10 @@ async function sendPushToUser(userId, { title, body, data = {} }) {
     if (error || !subs || subs.length === 0) return;
     await sendPushBatch(subs, { title, body, data });
   } catch (err) {
-    console.error(`[push] sendPushToUser error for user=${userId}:`, err.message);
+    console.error(
+      `[push] sendPushToUser error for user=${userId}:`,
+      err.message,
+    );
   }
 }
 
@@ -269,21 +314,29 @@ async function sendPushBatch(subscriptionRows, { title, body, data = {} }) {
           endpoint: sub.endpoint,
           keys: { p256dh: sub.p256dh, auth: sub.auth },
         },
-        payload
+        payload,
       );
       sent++;
       supabase
         .from("push_subscriptions")
         .update({ last_seen_at: new Date().toISOString() })
         .eq("id", sub.id)
-        .catch((e) => console.warn("push_subscriptions last_seen update failed:", e.message));
+        .catch((e) =>
+          console.warn(
+            "push_subscriptions last_seen update failed:",
+            e.message,
+          ),
+        );
     } catch (err) {
       const status = err?.statusCode;
       if (status === 410 || status === 404) {
         toPrune.push(sub.id);
       } else {
         failed++;
-        console.warn(`[push] send failed for endpoint=${sub.endpoint.slice(0,40)}...:`, err?.message || String(err));
+        console.warn(
+          `[push] send failed for endpoint=${sub.endpoint.slice(0, 40)}...:`,
+          err?.message || String(err),
+        );
       }
     }
   }
@@ -309,7 +362,11 @@ async function processBroadcastBatch(broadcastId, batchSize = 200) {
 
   try {
     const cursor = bc.last_processed_user_id;
-    let query = supabase.from("profiles").select("id").order("id", { ascending: true }).limit(batchSize);
+    let query = supabase
+      .from("profiles")
+      .select("id")
+      .order("id", { ascending: true })
+      .limit(batchSize);
     if (bc.target === "user" && bc.target_user_id) {
       query = query.eq("id", bc.target_user_id);
     } else if (cursor) {
@@ -320,10 +377,13 @@ async function processBroadcastBatch(broadcastId, batchSize = 200) {
     const { data: users, error: usersErr } = await query;
     if (usersErr) throw usersErr;
     if (!users || users.length === 0) {
-      await supabase.from("notification_broadcasts").update({
-        status: "done",
-        completed_at: new Date().toISOString(),
-      }).eq("id", broadcastId);
+      await supabase
+        .from("notification_broadcasts")
+        .update({
+          status: "done",
+          completed_at: new Date().toISOString(),
+        })
+        .eq("id", broadcastId);
       return { done: true, total_processed: bc.processed_count };
     }
 
@@ -336,8 +396,14 @@ async function processBroadcastBatch(broadcastId, batchSize = 200) {
       data: bc.data,
       created_by: bc.created_by,
     }));
-    const { error: notifErr } = await supabase.from("notifications").insert(notifRows);
-    if (notifErr) console.error("[broadcast] notifications insert failed:", notifErr.message);
+    const { error: notifErr } = await supabase
+      .from("notifications")
+      .insert(notifRows);
+    if (notifErr)
+      console.error(
+        "[broadcast] notifications insert failed:",
+        notifErr.message,
+      );
 
     try {
       const { data: subs } = await supabase
@@ -345,7 +411,11 @@ async function processBroadcastBatch(broadcastId, batchSize = 200) {
         .select("*")
         .in("user_id", userIds);
       if (subs && subs.length) {
-        await sendPushBatch(subs, { title: bc.title, body: bc.body, data: bc.data });
+        await sendPushBatch(subs, {
+          title: bc.title,
+          body: bc.body,
+          data: bc.data,
+        });
       }
     } catch (pushErr) {
       console.error("[broadcast] push send failed:", pushErr.message);
@@ -375,7 +445,10 @@ async function processBroadcastBatch(broadcastId, batchSize = 200) {
       total_recipients: finalTotal,
     };
   } catch (err) {
-    console.error(`[broadcast] batch process failed for ${broadcastId}:`, err.message);
+    console.error(
+      `[broadcast] batch process failed for ${broadcastId}:`,
+      err.message,
+    );
     return { error: err.message };
   }
 }
@@ -400,7 +473,9 @@ app.post("/api/push/subscribe", authenticateRequest, async (req, res) => {
   try {
     const { endpoint, p256dh, auth } = req.body || {};
     if (!endpoint || !p256dh || !auth) {
-      return res.status(400).json({ error: "endpoint, p256dh, auth are required" });
+      return res
+        .status(400)
+        .json({ error: "endpoint, p256dh, auth are required" });
     }
     const ua = typeof req.headers["user-agent"] || null;
     const now = new Date().toISOString();
@@ -410,13 +485,19 @@ app.post("/api/push/subscribe", authenticateRequest, async (req, res) => {
       .eq("endpoint", endpoint)
       .maybeSingle();
     if (existing) {
-      await supabase.from("push_subscriptions")
+      await supabase
+        .from("push_subscriptions")
         .update({ user_agent: ua, last_seen_at: now })
         .eq("id", existing.id);
       return res.json({ ok: true, updated: true });
     }
     const { error } = await supabase.from("push_subscriptions").insert({
-      user_id: req.user.id, endpoint, p256dh, auth, user_agent: ua, last_seen_at: now,
+      user_id: req.user.id,
+      endpoint,
+      p256dh,
+      auth,
+      user_agent: ua,
+      last_seen_at: now,
     });
     if (error) return res.status(500).json({ error: error.message });
     return res.json({ ok: true, created: true });
@@ -431,7 +512,8 @@ app.delete("/api/push/unsubscribe", authenticateRequest, async (req, res) => {
   try {
     const { endpoint } = req.body || {};
     if (!endpoint) return res.status(400).json({ error: "endpoint required" });
-    await supabase.from("push_subscriptions")
+    await supabase
+      .from("push_subscriptions")
       .delete()
       .eq("endpoint", endpoint)
       .eq("user_id", req.user.id);
@@ -447,7 +529,8 @@ app.post("/api/push/unsubscribe", authenticateRequest, async (req, res) => {
   try {
     const { endpoint } = req.body || {};
     if (!endpoint) return res.status(400).json({ error: "endpoint required" });
-    await supabase.from("push_subscriptions")
+    await supabase
+      .from("push_subscriptions")
       .delete()
       .eq("endpoint", endpoint)
       .eq("user_id", req.user.id);
@@ -459,10 +542,17 @@ app.post("/api/push/unsubscribe", authenticateRequest, async (req, res) => {
 });
 
 // ── wrap helper that does BOTH DB insert + push send (for backend-originated notifications only)
-async function notifyUser(userId, { type, title, body, data = {}, createdBy = null }) {
+async function notifyUser(
+  userId,
+  { type, title, body, data = {}, createdBy = null },
+) {
   await insertNotification({ userId, type, title, body, data, createdBy });
-  const ndata = (typeof data === "string" ? JSON.parse(data) : data);
-  await sendPushToUser(userId, { title, body, data: { ...ndata, url: ndata?.url } });
+  const ndata = typeof data === "string" ? JSON.parse(data) : data;
+  await sendPushToUser(userId, {
+    title,
+    body,
+    data: { ...ndata, url: ndata?.url },
+  });
 }
 
 // ─── Admin broadcast routes ────────────────────────────────────────────────
@@ -477,10 +567,14 @@ app.post(
         return res.status(400).json({ error: "title is required" });
       }
       if (!target || !["all", "user"].includes(target)) {
-        return res.status(400).json({ error: "target must be 'all' or 'user'" });
+        return res
+          .status(400)
+          .json({ error: "target must be 'all' or 'user'" });
       }
       if (target === "user" && !targetUserId) {
-        return res.status(400).json({ error: "targetUserId required for user target" });
+        return res
+          .status(400)
+          .json({ error: "targetUserId required for user target" });
       }
       // Compute total_recipients count
       let total = 0;
@@ -508,7 +602,9 @@ app.post(
         .single();
       if (bcErr) return res.status(500).json({ error: bcErr.message });
       // Kick off first batch synchronously (serverless-safe — no background thread pool).
-      processBroadcastBatch(bc.id, 200).catch((e) => console.error("broadcast kickoff failed:", e?.message || e));
+      processBroadcastBatch(bc.id, 200).catch((e) =>
+        console.error("broadcast kickoff failed:", e?.message || e),
+      );
       return res.status(202).json({ ok: true, broadcast: bc });
     } catch (err) {
       console.error("broadcast create error:", err);
@@ -534,7 +630,9 @@ app.get(
       if (!bc) return res.status(404).json({ error: "Broadcast not found" });
       // serverless — re-trigger next batch if still processing/pending (idempotent kicker)
       if (bc.status === "processing" || bc.status === "pending") {
-        processBroadcastBatch(bc.id, 200).catch((e) => console.warn("status poll kick error:", e?.message || e));
+        processBroadcastBatch(bc.id, 200).catch((e) =>
+          console.warn("status poll kick error:", e?.message || e),
+        );
       }
       return res.json(bc);
     } catch (err) {
@@ -572,7 +670,8 @@ app.get(
 
       const { data, error } = await supabase
         .from("notification_broadcasts")
-        .select(`
+        .select(
+          `
           id,
           title,
           target,
@@ -582,7 +681,8 @@ app.get(
           status,
           created_at,
           completed_at
-        `)
+        `,
+        )
         .order("created_at", { ascending: false })
         .limit(limit);
 
@@ -978,7 +1078,10 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
         } else if (txRow) {
           if (verifyStatus === "successful") {
             await completeTopupTransaction(txRow, verifyData);
-          } else if (verifyStatus === "failed" || verifyStatus === "cancelled") {
+          } else if (
+            verifyStatus === "failed" ||
+            verifyStatus === "cancelled"
+          ) {
             const { error: updateErr } = await supabase
               .from("wallet_transactions")
               .update({ status: "failed" })
@@ -986,7 +1089,12 @@ app.post("/api/webhooks/flutterwave", async (req, res) => {
               .eq("status", "pending");
             if (updateErr)
               console.error("Webhook failed-update error:", updateErr);
-            notifyUser(txRow.user_id, { type: "topup_failed", title: "Top-up failed", body: "Your top-up could not be completed. Please try again or contact support.", data: { url: "/wallet" } }).catch(() => {});
+            notifyUser(txRow.user_id, {
+              type: "topup_failed",
+              title: "Top-up failed",
+              body: "Your top-up could not be completed. Please try again or contact support.",
+              data: { url: "/wallet" },
+            }).catch(() => {});
           }
         }
       } catch (verifyErr) {
@@ -1065,7 +1173,8 @@ async function completeTopupTransaction(txRow, verifyData = null) {
   }
 
   const actualGatewayFee = verifyData?.app_fee ?? verifyData?.fee ?? null;
-  const amountSettled = verifyData?.amount_settled ?? verifyData?.settled_amount ?? null;
+  const amountSettled =
+    verifyData?.amount_settled ?? verifyData?.settled_amount ?? null;
   const grossAmount = Number(txRow.gross_amount || txRow.amount || 0);
   const feeBreakdown = calculatePaymentProcessingFee(
     grossAmount,
@@ -1300,7 +1409,12 @@ async function reconcilePendingTopups({
               .update({ status: "failed" })
               .eq("id", txRow.id)
               .eq("status", "pending");
-            notifyUser(txRow.user_id, { type: "topup_failed", title: "Top-up failed", body: "Your top-up could not be completed. Please try again or contact support.", data: { url: "/wallet" } }).catch(() => {});
+            notifyUser(txRow.user_id, {
+              type: "topup_failed",
+              title: "Top-up failed",
+              body: "Your top-up could not be completed. Please try again or contact support.",
+              data: { url: "/wallet" },
+            }).catch(() => {});
             reconciledCount++;
           }
           // outcome === "pending": still within the staleness window with
@@ -1362,9 +1476,15 @@ async function reconcilePendingTopups({
     }
 
     if (reconciledCount > 0) {
-      console.log(`Topup reconciliation: auto-reconciled ${reconciledCount} pending topups.`);
+      console.log(
+        `Topup reconciliation: auto-reconciled ${reconciledCount} pending topups.`,
+      );
     }
-    return { reconciled: reconciledCount, errors: errorCount, total: pendingTxns.length };
+    return {
+      reconciled: reconciledCount,
+      errors: errorCount,
+      total: pendingTxns.length,
+    };
   } catch (err) {
     console.error("Topup background reconciliation error:", err.message);
     return { reconciled: 0, errors: 1 };
@@ -1480,7 +1600,12 @@ app.post("/api/wallet/topup/verify", authenticateRequest, async (req, res) => {
         .eq("id", txRow.id)
         .eq("status", "pending");
 
-      notifyUser(txRow.user_id, { type: "topup_failed", title: "Top-up failed", body: "Your top-up could not be completed. Please try again or contact support.", data: { url: "/wallet" } }).catch(() => {});
+      notifyUser(txRow.user_id, {
+        type: "topup_failed",
+        title: "Top-up failed",
+        body: "Your top-up could not be completed. Please try again or contact support.",
+        data: { url: "/wallet" },
+      }).catch(() => {});
 
       return res.json({ status: "failed" });
     }
@@ -1624,11 +1749,9 @@ app.post("/api/banks/resolve", authenticateRequest, async (req, res) => {
       console.error(
         "Bank resolve rejected: FLUTTERWAVE_SECRET_KEY not configured",
       );
-      return res
-        .status(503)
-        .json({
-          error: "Payment gateway not configured — cannot verify account",
-        });
+      return res.status(503).json({
+        error: "Payment gateway not configured — cannot verify account",
+      });
     }
 
     try {
@@ -1852,16 +1975,18 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       const payRef = "quizpay_" + crypto.randomUUID();
       const paymentTxnId = "wtx_" + crypto.randomUUID();
 
-      const { error: payErr } = await supabase.from("wallet_transactions").insert({
-        id: paymentTxnId,
-        user_id: req.user.id,
-        amount: -priceNaira,
-        type: "quiz_payment",
-        status: "completed",
-        reference: payRef,
-        related_quiz_id: quiz.id,
-        related_attempt_id: attemptId,
-      });
+      const { error: payErr } = await supabase
+        .from("wallet_transactions")
+        .insert({
+          id: paymentTxnId,
+          user_id: req.user.id,
+          amount: -priceNaira,
+          type: "quiz_payment",
+          status: "completed",
+          reference: payRef,
+          related_quiz_id: quiz.id,
+          related_attempt_id: attemptId,
+        });
 
       if (payErr) {
         // 23505 = unique_violation on the partial unique index added in
@@ -3069,18 +3194,30 @@ app.get(
         .select("*", { count: "exact" })
         .order("created_at", { ascending: false });
 
-      if (role === "users") profilesQuery = profilesQuery.eq("role", "user").eq("is_suspended", false);
-      else if (role === "creators") profilesQuery = profilesQuery.eq("role", "creator");
-      else if (role === "admins") profilesQuery = profilesQuery.eq("role", "admin");
-      else if (role === "suspended") profilesQuery = profilesQuery.eq("is_suspended", true);
-      if (universityId !== "all") profilesQuery = profilesQuery.eq("university_id", universityId);
-      if (search) profilesQuery = profilesQuery.ilike("full_name", `%${search.replace(/[%,]/g, "")}%`);
+      if (role === "users")
+        profilesQuery = profilesQuery
+          .eq("role", "user")
+          .eq("is_suspended", false);
+      else if (role === "creators")
+        profilesQuery = profilesQuery.eq("role", "creator");
+      else if (role === "admins")
+        profilesQuery = profilesQuery.eq("role", "admin");
+      else if (role === "suspended")
+        profilesQuery = profilesQuery.eq("is_suspended", true);
+      if (universityId !== "all")
+        profilesQuery = profilesQuery.eq("university_id", universityId);
+      if (search)
+        profilesQuery = profilesQuery.ilike(
+          "full_name",
+          `%${search.replace(/[%,]/g, "")}%`,
+        );
 
       const start = (page - 1) * pageSize;
-      const { data: profiles, count, error: profErr } = await profilesQuery.range(
-        start,
-        start + pageSize - 1,
-      );
+      const {
+        data: profiles,
+        count,
+        error: profErr,
+      } = await profilesQuery.range(start, start + pageSize - 1);
       if (profErr)
         return res.status(500).json({ error: "Failed to fetch profiles" });
 
