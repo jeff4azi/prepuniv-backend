@@ -3791,6 +3791,11 @@ const STATIC_SITEMAP_PAGES = [
     changefreq: "monthly",
     priority: "0.4",
   },
+  {
+    loc: `${SITE_BASE_URL}/creator/agreement`,
+    changefreq: "monthly",
+    priority: "0.4",
+  },
   { loc: `${SITE_BASE_URL}/terms`, changefreq: "monthly", priority: "0.2" },
   { loc: `${SITE_BASE_URL}/privacy`, changefreq: "monthly", priority: "0.2" },
 ];
