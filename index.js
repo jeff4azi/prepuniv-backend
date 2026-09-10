@@ -1906,6 +1906,12 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
     if (quizErr) throw quizErr;
     if (!quiz) return res.status(404).json({ error: "Quiz not found" });
 
+    // Quiz creators always get a free attempt on their own quiz — never
+    // treat this as a chargeable "first time", regardless of payment
+    // history. Ownership is checked against quiz.creator_id (from the DB
+    // row itself), so this can't be spoofed via the request body.
+    const isOwner = quiz.creator_id === req.user.id;
+
     // Check if user has already paid for this quiz
     const { data: existingPay } = await supabase
       .from("wallet_transactions")
@@ -1916,7 +1922,7 @@ app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
       .eq("status", "completed")
       .maybeSingle();
 
-    const isFirstTime = !existingPay;
+    const isFirstTime = !existingPay && !isOwner;
     const version = await syncQuizVersion(quiz.id);
 
     // Retake path — the user has already paid, so just create a new
