@@ -3259,6 +3259,85 @@ app.get(
   },
 );
 
+// GET /api/admin/users/search?q= — typeahead user search for the broadcast
+// composer. Returns up to 20 profiles whose name or email match the query,
+// with real auth emails resolved via the service-role admin API.
+app.get(
+  "/api/admin/users/search",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const q = (req.query.q || "").toString().trim();
+      if (!q) return res.json({ users: [] });
+
+      const pattern = `%${q.replace(/[%_]/g, "")}%`;
+
+      // 1. Find profiles whose display name matches
+      const { data: nameMatches, error: nameErr } = await supabase
+        .from("profiles")
+        .select("id, full_name, avatar_url")
+        .ilike("full_name", pattern)
+        .order("created_at", { ascending: false })
+        .limit(20);
+
+      if (nameErr) throw nameErr;
+
+      // 2. Resolve real emails for every matched profile via service-role admin API
+      const withEmails = await Promise.all(
+        (nameMatches || []).map(async (profile) => {
+          const { data } = await supabase.auth.admin.getUserById(profile.id);
+          return {
+            id: profile.id,
+            full_name: profile.full_name,
+            avatar_url: profile.avatar_url || null,
+            email: data?.user?.email || null,
+          };
+        }),
+      );
+
+      // 3. If the query looks like an email fragment, also search auth directly
+      //    and merge any additional results not already in the name-match list
+      if (q.includes("@") || !q.includes(" ")) {
+        // listUsers doesn't support filtering, so we page through and match
+        // client-side — cap at a reasonable scan to keep response fast.
+        const { data: authList } = await supabase.auth.admin.listUsers({
+          page: 1,
+          perPage: 500,
+        });
+        if (authList?.users) {
+          const existingIds = new Set(withEmails.map((u) => u.id));
+          const emailLower = q.toLowerCase();
+          for (const authUser of authList.users) {
+            if (existingIds.has(authUser.id)) continue;
+            if (!authUser.email?.toLowerCase().includes(emailLower)) continue;
+            // Fetch their profile for the display name
+            const { data: prof } = await supabase
+              .from("profiles")
+              .select("id, full_name, avatar_url")
+              .eq("id", authUser.id)
+              .maybeSingle();
+            if (prof) {
+              withEmails.push({
+                id: prof.id,
+                full_name: prof.full_name,
+                avatar_url: prof.avatar_url || null,
+                email: authUser.email,
+              });
+              if (withEmails.length >= 20) break;
+            }
+          }
+        }
+      }
+
+      return res.json({ users: withEmails.slice(0, 20) });
+    } catch (err) {
+      console.error("Admin user search error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
 // POST /api/admin/users/:id/suspend — toggle suspension
 // On suspend:   hides creator quizzes (snapshots which were live), force-revokes sessions.
 // On unsuspend: restores only the quizzes that were published before suspension.
