@@ -1940,7 +1940,9 @@ app.get("/api/quiz/:id/preview-questions", async (req, res) => {
     //    b) fill slots from the start of the quiz for the fallback
     const { data: allQs, error: qsErr } = await supabase
       .from("questions")
-      .select("id, quiz_id, type, question_text, options, correct_answer, order_index")
+      .select(
+        "id, quiz_id, type, question_text, options, correct_answer, order_index",
+      )
       .eq("quiz_id", quizId)
       .order("order_index", { ascending: true });
 
@@ -2491,6 +2493,114 @@ app.post(
     } catch (err) {
       console.error("Course upsert outer error:", err);
       return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
+// POST /api/creator/quiz/:id/save-questions
+// Replaces all questions for a quiz and persists preview_question_ids.
+// Uses the service-role client so:
+//   - The DELETE works even when RLS blocks the anon/auth role.
+//   - preview_question_ids is written as text[] matching the actual
+//     column type (questions.id is text, not uuid, per migration 007).
+app.post(
+  "/api/creator/quiz/:id/save-questions",
+  authenticateRequest,
+  async (req, res) => {
+    try {
+      const { id: quizId } = req.params;
+      const { questions: questionsPayload, preview_question_ids } =
+        req.body || {};
+
+      // ── Verify caller owns this quiz ──────────────────────────────────────
+      const { data: quiz, error: quizErr } = await supabase
+        .from("quizzes")
+        .select("id, creator_id")
+        .eq("id", quizId)
+        .maybeSingle();
+
+      if (quizErr || !quiz) {
+        return res.status(404).json({ error: "Quiz not found." });
+      }
+      if (quiz.creator_id !== req.user.id) {
+        return res.status(403).json({ error: "Not your quiz." });
+      }
+
+      // ── Delete existing questions (service role — bypasses RLS) ───────────
+      const { error: delErr } = await supabase
+        .from("questions")
+        .delete()
+        .eq("quiz_id", quizId);
+
+      // A "no rows deleted" result is fine — ignore PGRST116
+      if (delErr && delErr.code !== "PGRST116") {
+        console.error("Question delete error:", delErr);
+        return res.status(500).json({ error: delErr.message });
+      }
+
+      // ── Insert new questions ──────────────────────────────────────────────
+      let insertedIds = [];
+      if (Array.isArray(questionsPayload) && questionsPayload.length > 0) {
+        const { data: inserted, error: insertErr } = await supabase
+          .from("questions")
+          .insert(questionsPayload)
+          .select("id, order_index");
+
+        if (insertErr) {
+          console.error("Question insert error:", insertErr);
+          return res.status(500).json({ error: insertErr.message });
+        }
+        insertedIds = (inserted ?? []).sort(
+          (a, b) => (a.order_index ?? 0) - (b.order_index ?? 0),
+        );
+      }
+
+      // ── Persist preview_question_ids as text[] ────────────────────────────
+      // preview_question_ids can arrive in two forms:
+      //   - preview_by_index: true  → array of 0-based position indices into
+      //     the inserted questions (sorted by order_index). The backend resolves
+      //     these to real DB IDs after insertion.
+      //   - preview_by_index: false/absent → array of already-resolved DB ID strings.
+      // The column is text[] (questions.id is text per migration 007), so
+      // this is a clean text[] → text[] write — no uuid cast issues.
+      let finalPreviewIds = insertedIds.slice(0, 5).map((r) => r.id); // default: first 5
+
+      if (
+        Array.isArray(preview_question_ids) &&
+        preview_question_ids.length > 0
+      ) {
+        if (req.body.preview_by_index) {
+          // Resolve 0-based indices → real inserted IDs
+          const resolved = preview_question_ids
+            .map((idx) => insertedIds[idx]?.id)
+            .filter(Boolean)
+            .slice(0, 5);
+          if (resolved.length > 0) finalPreviewIds = resolved;
+        } else {
+          finalPreviewIds = preview_question_ids.slice(0, 5);
+        }
+      }
+
+      const { error: previewErr } = await supabase
+        .from("quizzes")
+        .update({ preview_question_ids: finalPreviewIds })
+        .eq("id", quizId);
+
+      if (previewErr) {
+        // Non-fatal — log but don't fail the whole save
+        console.error("preview_question_ids update error:", previewErr);
+      }
+
+      return res.status(200).json({
+        inserted_count: insertedIds.length,
+        inserted_ids: insertedIds.map((r) => r.id),
+        preview_question_ids: finalPreviewIds,
+      });
+    } catch (err) {
+      console.error("save-questions error:", err);
+      return res
+        .status(500)
+        .json({ error: "Internal server error", detail: String(err) });
     }
   },
 );
