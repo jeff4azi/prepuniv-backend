@@ -10,7 +10,6 @@ import {
   roundToTwoDecimals,
 } from "./feeCalculator.js";
 import webpush from "web-push";
-import { createOgMiddleware } from "./ogMiddleware.js";
 import {
   isQuizPubliclyVisible,
   isCreatorPubliclyVisible,
@@ -122,15 +121,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 // Must be mounted BEFORE API routes and BEFORE any static-file / SPA-fallback
 // middleware. Intercepts GET /quiz/:id and GET /profile/creator/:id, injects
 // page-specific OG tags into the served HTML, then returns. All other requests
-// pass straight through to the next handler.
-//
-// See ogMiddleware.js for the important production deployment note: this only
-// works when the Express backend also serves the SPA's index.html. In the
-// current split-deployment setup (frontend on its own Vercel project) this is
-// active in local dev and any co-located deployment, but NOT for production
-// link previews without an infrastructure change. Read the note in that file.
-app.use(createOgMiddleware(supabase));
-
 const authenticateRequest = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
