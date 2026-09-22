@@ -1891,6 +1891,123 @@ async function syncQuizVersion(quizId) {
   }
 }
 
+// ─── Get Preview Questions for a Quiz ────────────────────────────────────────
+// Public, unauthenticated endpoint. Uses service role so it works for EVERY
+// visitor (guests, non-purchasers, purchasers) and handles the "first 5
+// questions" fallback even when preview_question_ids is NULL on legacy quizzes.
+//
+// Resolution order (handles ALL edge cases):
+//   1. If quiz.preview_question_ids is set: fetch those specific IDs, drop
+//      deleted/missing ones, preserve stored order.
+//   2. Fill remaining slots (up to 5) with questions from the start of the
+//      quiz (order_index ASC), skipping any already included.
+//   3. If no preview_question_ids at all: simply return the first 5 questions.
+//   4. Return [] only if the quiz has ZERO valid questions — the frontend
+//      hides the "Try preview" CTA in that case.
+app.get("/api/quiz/:id/preview-questions", async (req, res) => {
+  try {
+    const { id: quizId } = req.params;
+    const MAX_PREVIEW = 5;
+
+    // 1. Fetch quiz (confirm it exists & is public)
+    const { data: quiz, error: quizErr } = await supabase
+      .from("quizzes")
+      .select("id, is_published, unpublished_by_admin, preview_question_ids")
+      .eq("id", quizId)
+      .maybeSingle();
+
+    if (quizErr) throw quizErr;
+    if (!quiz) return res.status(404).json({ error: "Quiz not found" });
+
+    // Respect unpublished/admin-blocked state — don't leak any questions
+    // from a quiz that's been taken down. Non-published creators can still
+    // see their preview via the builder (it uses direct Supabase access).
+    if (!quiz.is_published || quiz.unpublished_by_admin) {
+      return res.json({ preview_count: 0, questions: [] });
+    }
+
+    // 2. Collect configured preview IDs (if any)
+    const configuredIds =
+      Array.isArray(quiz.preview_question_ids) &&
+      quiz.preview_question_ids.length > 0
+        ? quiz.preview_question_ids
+            .filter((v) => typeof v === "string")
+            .slice(0, MAX_PREVIEW)
+        : [];
+
+    // 3. Fetch ALL quiz questions (service role bypasses RLS) so we can
+    //    a) resolve configured IDs that still exist
+    //    b) fill slots from the start of the quiz for the fallback
+    const { data: allQs, error: qsErr } = await supabase
+      .from("questions")
+      .select("id, quiz_id, type, question_text, options, correct_answer, order_index")
+      .eq("quiz_id", quizId)
+      .order("order_index", { ascending: true });
+
+    if (qsErr) throw qsErr;
+    if (!allQs || allQs.length === 0) {
+      return res.json({ preview_count: 0, questions: [] });
+    }
+
+    const allById = new Map(allQs.map((q) => [q.id, q]));
+    const includedIds = new Set<string>();
+    const finalList: typeof allQs = [];
+
+    // Phase A — add from configured preview_question_ids (in stored order)
+    for (const id of configuredIds) {
+      const q = allById.get(id);
+      if (q && !includedIds.has(q.id)) {
+        includedIds.add(q.id);
+        finalList.push(q);
+        if (finalList.length >= MAX_PREVIEW) break;
+      }
+    }
+
+    // Phase B — fill remaining slots from the start of the quiz
+    if (finalList.length < MAX_PREVIEW) {
+      for (const q of allQs) {
+        if (includedIds.has(q.id)) continue;
+        includedIds.add(q.id);
+        finalList.push(q);
+        if (finalList.length >= MAX_PREVIEW) break;
+      }
+    }
+
+    // Shape response to match the Question type the frontend expects
+    const shaped = finalList.map((q) => {
+      let opts: string[] | undefined;
+      if (Array.isArray(q.options)) {
+        opts = q.options as string[];
+      } else if (typeof q.options === "string") {
+        try {
+          opts = JSON.parse(q.options) as string[];
+        } catch {
+          opts = undefined;
+        }
+      }
+      return {
+        id: q.id,
+        quiz_id: q.quiz_id,
+        type: q.type as "mcq" | "fill_blank",
+        question_text: q.question_text,
+        options: opts,
+        correct_answer:
+          typeof q.correct_answer === "string"
+            ? q.correct_answer
+            : String(q.correct_answer ?? ""),
+      };
+    });
+
+    return res.json({
+      preview_count: shaped.length,
+      questions: shaped,
+    });
+  } catch (err) {
+    console.error("Preview questions error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // ─── Start / Retake a Quiz (creates a attempt row) ──────────────────────────
 app.post("/api/quiz/:id/attempt", authenticateRequest, async (req, res) => {
   try {
