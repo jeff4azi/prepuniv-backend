@@ -1950,8 +1950,8 @@ app.get("/api/quiz/:id/preview-questions", async (req, res) => {
     }
 
     const allById = new Map(allQs.map((q) => [q.id, q]));
-    const includedIds = new Set<string>();
-    const finalList: typeof allQs = [];
+    const includedIds = new Set();
+    const finalList = [];
 
     // Phase A — add from configured preview_question_ids (in stored order)
     for (const id of configuredIds) {
@@ -1975,12 +1975,12 @@ app.get("/api/quiz/:id/preview-questions", async (req, res) => {
 
     // Shape response to match the Question type the frontend expects
     const shaped = finalList.map((q) => {
-      let opts: string[] | undefined;
+      let opts;
       if (Array.isArray(q.options)) {
-        opts = q.options as string[];
+        opts = q.options;
       } else if (typeof q.options === "string") {
         try {
-          opts = JSON.parse(q.options) as string[];
+          opts = JSON.parse(q.options);
         } catch {
           opts = undefined;
         }
@@ -1988,7 +1988,7 @@ app.get("/api/quiz/:id/preview-questions", async (req, res) => {
       return {
         id: q.id,
         quiz_id: q.quiz_id,
-        type: q.type as "mcq" | "fill_blank",
+        type: q.type,
         question_text: q.question_text,
         options: opts,
         correct_answer:
