@@ -3453,14 +3453,21 @@ app.get(
       const authUsers = await Promise.all(
         (profiles || []).map(async (profile) => {
           const { data } = await supabase.auth.admin.getUserById(profile.id);
-          return [profile.id, data?.user?.email || null];
+          return [
+            profile.id,
+            {
+              email: data?.user?.email || null,
+              email_confirmed_at: data?.user?.email_confirmed_at || null,
+            },
+          ];
         }),
       );
-      const emailMap = Object.fromEntries(authUsers);
+      const authMap = Object.fromEntries(authUsers);
 
       const enriched = (profiles || []).map((p) => ({
         ...p,
-        email: emailMap[p.id] || null,
+        email: authMap[p.id]?.email || null,
+        email_confirmed_at: authMap[p.id]?.email_confirmed_at || null,
       }));
 
       return res.json({
