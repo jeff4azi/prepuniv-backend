@@ -3679,6 +3679,47 @@ app.post(
   },
 );
 
+// DELETE /api/admin/users/:id — permanently delete an unconfirmed account.
+// Only allowed when the auth user has no confirmed email — this is a safety
+// guard so admins can't accidentally hard-delete real active accounts.
+app.delete(
+  "/api/admin/users/:id",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      // Verify the account exists and is unconfirmed
+      const { data: authUser, error: authErr } =
+        await supabase.auth.admin.getUserById(id);
+
+      if (authErr || !authUser?.user) {
+        return res.status(404).json({ error: "User not found." });
+      }
+      if (authUser.user.email_confirmed_at) {
+        return res.status(403).json({
+          error:
+            "This account has a confirmed email and cannot be deleted this way.",
+        });
+      }
+
+      // Delete from Supabase Auth (cascades to profiles via DB trigger/FK)
+      const { error: deleteErr } = await supabase.auth.admin.deleteUser(id);
+
+      if (deleteErr) {
+        console.error("Admin delete user error:", deleteErr);
+        return res.status(500).json({ error: deleteErr.message });
+      }
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("Admin delete user error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
 // POST /api/admin/quizzes/:id/unpublish — admin force-unpublish
 app.post(
   "/api/admin/quizzes/:id/unpublish",
