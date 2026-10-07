@@ -4267,7 +4267,7 @@ app.post("/api/reviews", authenticateRequest, async (req, res) => {
       .eq("user_id", reviewerId)
       .eq("type", "quiz_payment")
       .eq("status", "completed")
-      .in("quiz_id", creatorQuizIds);
+      .in("related_quiz_id", creatorQuizIds);
     if (purchaseErr || (purchaseCount ?? 0) === 0) {
       return res.status(403).json({
         error: "You need to purchase at least one quiz from this creator before rating them.",
@@ -4344,7 +4344,7 @@ app.get("/api/reviews/eligible", authenticateRequest, async (req, res) => {
       .eq("user_id", reviewerId)
       .eq("type", "quiz_payment")
       .eq("status", "completed")
-      .in("quiz_id", ids);
+      .in("related_quiz_id", ids);
     return res.json({ eligible: (count ?? 0) > 0 });
   }
   return res.status(400).json({ error: "type must be 'quiz', 'creator', or 'platform'" });
