@@ -4206,6 +4206,366 @@ app.get("/sitemap.xml", async (req, res) => {
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REVIEWS — Write Path (POST / PATCH / DELETE / admin moderation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * POST /api/reviews
+ * Submit a new review. Authenticity checks:
+ *   quiz    → reviewer has ≥1 completed quiz_attempt for target_quiz_id
+ *   creator → reviewer has ≥1 completed quiz_payment for any quiz by that creator
+ *   platform → any authenticated user (once per user, unique constraint enforced by DB)
+ */
+app.post("/api/reviews", authenticateRequest, async (req, res) => {
+  const { target_type, target_quiz_id, target_creator_id, rating, review_text } = req.body;
+  const reviewerId = req.user.id;
+
+  if (!["quiz", "creator", "platform"].includes(target_type)) {
+    return res.status(400).json({ error: "target_type must be 'quiz', 'creator', or 'platform'." });
+  }
+  if (typeof rating !== "number" || rating < 1 || rating > 5) {
+    return res.status(400).json({ error: "rating must be an integer between 1 and 5." });
+  }
+  if (review_text && typeof review_text === "string" && review_text.length > 280) {
+    return res.status(400).json({ error: "review_text must be 280 characters or fewer." });
+  }
+
+  // ── Authenticity gate ──────────────────────────────────────────────────────
+  if (target_type === "quiz") {
+    if (!target_quiz_id) {
+      return res.status(400).json({ error: "target_quiz_id is required for quiz reviews." });
+    }
+    const { count, error } = await supabase
+      .from("quiz_attempts")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", reviewerId)
+      .eq("quiz_id", target_quiz_id)
+      .not("completed_at", "is", null);
+    if (error || (count ?? 0) === 0) {
+      return res.status(403).json({
+        error: "You need to complete this quiz at least once before rating it.",
+      });
+    }
+  } else if (target_type === "creator") {
+    if (!target_creator_id) {
+      return res.status(400).json({ error: "target_creator_id is required for creator reviews." });
+    }
+    // Verify reviewer has purchased at least one quiz from this creator
+    const { data: creatorQuizzes } = await supabase
+      .from("quizzes")
+      .select("id")
+      .eq("creator_id", target_creator_id);
+    const creatorQuizIds = (creatorQuizzes ?? []).map((q) => q.id);
+    if (creatorQuizIds.length === 0) {
+      return res.status(400).json({ error: "This creator has no published quizzes." });
+    }
+    const { count: purchaseCount, error: purchaseErr } = await supabase
+      .from("wallet_transactions")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", reviewerId)
+      .eq("type", "quiz_payment")
+      .eq("status", "completed")
+      .in("quiz_id", creatorQuizIds);
+    if (purchaseErr || (purchaseCount ?? 0) === 0) {
+      return res.status(403).json({
+        error: "You need to purchase at least one quiz from this creator before rating them.",
+      });
+    }
+  }
+
+  // ── Insert ─────────────────────────────────────────────────────────────────
+  const insertPayload = {
+    reviewer_id: reviewerId,
+    review_target_type: target_type,
+    rating,
+    ...(review_text ? { review_text: review_text.slice(0, 280) } : {}),
+    ...(target_type === "quiz" && target_quiz_id ? { target_quiz_id } : {}),
+    ...(target_type === "creator" && target_creator_id ? { target_creator_id } : {}),
+  };
+
+  const { data, error } = await supabase
+    .from("reviews")
+    .insert(insertPayload)
+    .select()
+    .single();
+
+  if (error) {
+    // Unique constraint = duplicate review
+    if (error.code === "23505") {
+      return res.status(409).json({
+        error: "You have already submitted a review for this target. Use PATCH to update it.",
+      });
+    }
+    console.error("[POST /api/reviews] DB error:", error.message);
+    return res.status(500).json({ error: "Failed to submit review. Please try again." });
+  }
+
+  return res.status(201).json(data);
+});
+
+/**
+ * GET /api/reviews/eligible
+ * Returns { eligible: true/false } for a given target.
+ * Used by UI to decide whether to show the review entry form.
+ *
+ * Query params:
+ *   type=quiz&quiz_id=<uuid>      → has user completed this quiz?
+ *   type=creator&creator_id=<uuid> → has user purchased from this creator?
+ *   type=platform                  → always eligible for authenticated users
+ */
+app.get("/api/reviews/eligible", authenticateRequest, async (req, res) => {
+  const { type, quiz_id, creator_id } = req.query;
+  const reviewerId = req.user.id;
+
+  if (type === "platform") {
+    return res.json({ eligible: true });
+  }
+  if (type === "quiz") {
+    if (!quiz_id) return res.status(400).json({ error: "quiz_id required" });
+    const { count } = await supabase
+      .from("quiz_attempts")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", reviewerId)
+      .eq("quiz_id", quiz_id)
+      .not("completed_at", "is", null);
+    return res.json({ eligible: (count ?? 0) > 0 });
+  }
+  if (type === "creator") {
+    if (!creator_id) return res.status(400).json({ error: "creator_id required" });
+    const { data: creatorQuizzes } = await supabase
+      .from("quizzes").select("id").eq("creator_id", creator_id);
+    const ids = (creatorQuizzes ?? []).map((q) => q.id);
+    if (ids.length === 0) return res.json({ eligible: false });
+    const { count } = await supabase
+      .from("wallet_transactions")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", reviewerId)
+      .eq("type", "quiz_payment")
+      .eq("status", "completed")
+      .in("quiz_id", ids);
+    return res.json({ eligible: (count ?? 0) > 0 });
+  }
+  return res.status(400).json({ error: "type must be 'quiz', 'creator', or 'platform'" });
+});
+
+/**
+ * GET /api/reviews/mine
+ * Returns all reviews the authenticated user has submitted.
+ */
+app.get("/api/reviews/mine", authenticateRequest, async (req, res) => {
+  const reviewerId = req.user.id;
+  const { data, error } = await supabase
+    .from("reviews")
+    .select(`
+      id, review_target_type, target_quiz_id, target_creator_id,
+      rating, review_text, is_approved, is_featured, is_hidden, created_at, updated_at,
+      quizzes:target_quiz_id ( title ),
+      creator:target_creator_id ( full_name )
+    `)
+    .eq("reviewer_id", reviewerId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.error("[GET /api/reviews/mine] error:", error.message);
+    return res.status(500).json({ error: "Failed to fetch your reviews." });
+  }
+  return res.json(data ?? []);
+});
+
+/**
+ * PATCH /api/reviews/:id
+ * Reviewer can update their own review's rating and/or review_text.
+ * Cannot touch is_featured, is_approved, is_hidden.
+ */
+app.patch("/api/reviews/:id", authenticateRequest, async (req, res) => {
+  const { id } = req.params;
+  const reviewerId = req.user.id;
+  const { rating, review_text } = req.body;
+
+  if (rating !== undefined && (typeof rating !== "number" || rating < 1 || rating > 5)) {
+    return res.status(400).json({ error: "rating must be an integer between 1 and 5." });
+  }
+
+  // Confirm ownership first
+  const { data: existing, error: fetchErr } = await supabase
+    .from("reviews")
+    .select("id, reviewer_id")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (fetchErr || !existing) {
+    return res.status(404).json({ error: "Review not found." });
+  }
+  if (existing.reviewer_id !== reviewerId) {
+    return res.status(403).json({ error: "Forbidden: you can only edit your own reviews." });
+  }
+
+  const updatePayload = {};
+  if (rating !== undefined) updatePayload.rating = rating;
+  if (review_text !== undefined) updatePayload.review_text = review_text ? review_text.slice(0, 280) : null;
+
+  const { data, error } = await supabase
+    .from("reviews")
+    .update(updatePayload)
+    .eq("id", id)
+    .select()
+    .single();
+
+  if (error) {
+    console.error("[PATCH /api/reviews/:id] error:", error.message);
+    return res.status(500).json({ error: "Failed to update review." });
+  }
+  return res.json(data);
+});
+
+/**
+ * DELETE /api/reviews/:id
+ * Reviewer deletes their own review.
+ */
+app.delete("/api/reviews/:id", authenticateRequest, async (req, res) => {
+  const { id } = req.params;
+  const reviewerId = req.user.id;
+
+  const { data: existing, error: fetchErr } = await supabase
+    .from("reviews")
+    .select("id, reviewer_id")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (fetchErr || !existing) {
+    return res.status(404).json({ error: "Review not found." });
+  }
+  if (existing.reviewer_id !== reviewerId) {
+    return res.status(403).json({ error: "Forbidden: you can only delete your own reviews." });
+  }
+
+  const { error } = await supabase.from("reviews").delete().eq("id", id);
+  if (error) {
+    console.error("[DELETE /api/reviews/:id] error:", error.message);
+    return res.status(500).json({ error: "Failed to delete review." });
+  }
+  return res.status(204).send();
+});
+
+// ── Admin review moderation routes ────────────────────────────────────────────
+
+/**
+ * GET /api/admin/reviews
+ * List reviews for admin moderation.
+ * Query: ?status=pending|approved|hidden|all (default: all)
+ */
+app.get("/api/admin/reviews", authenticateRequest, requireAdmin, async (req, res) => {
+  const { status = "all", limit = 50, offset = 0 } = req.query;
+
+  let query = supabase
+    .from("reviews")
+    .select(`
+      id, review_target_type, target_quiz_id, target_creator_id,
+      rating, review_text, is_approved, is_featured, is_hidden,
+      reviewer_id, created_at, updated_at,
+      reviewer:reviewer_id ( full_name, avatar_url ),
+      quizzes:target_quiz_id ( title ),
+      creator:target_creator_id ( full_name )
+    `)
+    .order("created_at", { ascending: false })
+    .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+  if (status === "pending") {
+    query = query.eq("is_approved", false).eq("is_hidden", false);
+  } else if (status === "approved") {
+    query = query.eq("is_approved", true).eq("is_hidden", false);
+  } else if (status === "hidden") {
+    query = query.eq("is_hidden", true);
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    console.error("[GET /api/admin/reviews] error:", error.message);
+    return res.status(500).json({ error: "Failed to fetch reviews." });
+  }
+  return res.json(data ?? []);
+});
+
+/**
+ * POST /api/admin/reviews/:id/approve
+ * Set is_approved = true, is_hidden = false.
+ */
+app.post("/api/admin/reviews/:id/approve", authenticateRequest, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { data, error } = await supabase
+    .from("reviews")
+    .update({ is_approved: true, is_hidden: false })
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json(data);
+});
+
+/**
+ * POST /api/admin/reviews/:id/feature
+ * Set is_featured = true (also ensures is_approved = true, is_hidden = false).
+ */
+app.post("/api/admin/reviews/:id/feature", authenticateRequest, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { data, error } = await supabase
+    .from("reviews")
+    .update({ is_featured: true, is_approved: true, is_hidden: false })
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json(data);
+});
+
+/**
+ * POST /api/admin/reviews/:id/unfeature
+ * Removes featured status.
+ */
+app.post("/api/admin/reviews/:id/unfeature", authenticateRequest, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { data, error } = await supabase
+    .from("reviews")
+    .update({ is_featured: false })
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json(data);
+});
+
+/**
+ * POST /api/admin/reviews/:id/hide
+ * Set is_hidden = true, is_featured = false.
+ */
+app.post("/api/admin/reviews/:id/hide", authenticateRequest, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { data, error } = await supabase
+    .from("reviews")
+    .update({ is_hidden: true, is_featured: false })
+    .eq("id", id)
+    .select()
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json(data);
+});
+
+/**
+ * DELETE /api/admin/reviews/:id
+ * Admin hard-deletes a review (no ownership check).
+ */
+app.delete("/api/admin/reviews/:id", authenticateRequest, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { error } = await supabase.from("reviews").delete().eq("id", id);
+  if (error) {
+    console.error("[DELETE /api/admin/reviews/:id] error:", error.message);
+    return res.status(500).json({ error: "Failed to delete review." });
+  }
+  return res.status(204).send();
+});
+
 // app.listen is only used in local development.
 // On Vercel (serverless), the exported app is used directly as the handler.
 if (process.env.NODE_ENV !== "production") {
