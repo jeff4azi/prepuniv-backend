@@ -19,6 +19,7 @@ dotenv.config();
 
 const CORS_ALLOWED_ORIGINS = [
   "https://prepuniv.com",
+  "https://www.prepuniv.com",
   "http://localhost:5173",
   "https://backend.prepuniv.com",
 ];
