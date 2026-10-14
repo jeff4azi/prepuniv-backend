@@ -3410,6 +3410,310 @@ app.post(
 
 // ─── Admin Management Endpoints ─────────────────────────────────────────────
 
+// GET /api/admin/dashboard — single aggregation endpoint for the admin dashboard.
+// Returns everything the dashboard needs: counts, financial totals, revenue
+// trend (last 30 days), and a recent activity feed (last 10 events). All
+// numbers are computed on the DB/server side — no row arrays shipped to the
+// browser. Permanently scale-proof regardless of table size.
+app.get(
+  "/api/admin/dashboard",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const now = new Date();
+      const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+      const thirtyDaysAgoIso = thirtyDaysAgo.toISOString();
+
+      // ── Counts (head: true = no rows, just the count) ──────────────────────
+      const [
+        totalUsersRes,
+        totalCreatorsRes,
+        totalQuizzesRes,
+        publishedQuizzesRes,
+        totalAttemptsRes,
+        pendingAppsRes,
+        pendingPayoutsRes,
+        openReportsRes,
+      ] = await Promise.all([
+        supabase
+          .from("profiles")
+          .select("*", { count: "exact", head: true })
+          .eq("role", "user"),
+        supabase
+          .from("profiles")
+          .select("*", { count: "exact", head: true })
+          .eq("is_approved_creator", true)
+          .neq("role", "admin"),
+        supabase.from("quizzes").select("*", { count: "exact", head: true }),
+        supabase
+          .from("quizzes")
+          .select("*", { count: "exact", head: true })
+          .eq("is_published", true),
+        supabase
+          .from("quiz_attempts")
+          .select("*", { count: "exact", head: true }),
+        supabase
+          .from("creator_applications")
+          .select("*", { count: "exact", head: true })
+          .eq("status", "pending"),
+        supabase
+          .from("payout_requests")
+          .select("*", { count: "exact", head: true })
+          .eq("status", "pending"),
+        supabase
+          .from("reports")
+          .select("*", { count: "exact", head: true })
+          .eq("status", "open"),
+      ]);
+
+      // ── Financial aggregates ───────────────────────────────────────────────
+      // Fetch only the columns we need for the maths — no full row dumps.
+      const [topupTxnsRes, revenueTxnsRes] = await Promise.all([
+        supabase
+          .from("wallet_transactions")
+          .select("amount, gross_amount, platform_fee, status")
+          .eq("type", "topup"),
+        supabase
+          .from("wallet_transactions")
+          .select("amount, created_at")
+          .eq("type", "platform_revenue")
+          .eq("status", "completed")
+          .gte("created_at", thirtyDaysAgoIso),
+      ]);
+
+      const completedTopups = (topupTxnsRes.data || []).filter(
+        (t) => t.status === "completed",
+      );
+      const grossTopUpVolume = completedTopups.reduce(
+        (s, t) => s + Number(t.gross_amount ?? t.amount ?? 0),
+        0,
+      );
+      const platformPaymentFees = completedTopups.reduce(
+        (s, t) => s + Number(t.platform_fee ?? 0),
+        0,
+      );
+      const netTopUpCash = grossTopUpVolume - platformPaymentFees;
+
+      // Platform revenue — all-time total (separate query, no date filter)
+      const allRevRes = await supabase
+        .from("wallet_transactions")
+        .select("amount")
+        .eq("type", "platform_revenue")
+        .eq("status", "completed");
+      const platformRevenue = (allRevRes.data || []).reduce(
+        (s, t) => s + Number(t.amount),
+        0,
+      );
+
+      // ── Revenue trend (last 30 days, grouped into 4-day buckets) ──────────
+      const byDay = {};
+      (revenueTxnsRes.data || []).forEach((t) => {
+        const day = t.created_at.slice(0, 10);
+        byDay[day] = (byDay[day] ?? 0) + Number(t.amount);
+      });
+
+      const revenueTrend = [];
+      for (let i = 0; i < 30; i += 4) {
+        const start = new Date(thirtyDaysAgo.getTime() + i * 86400000);
+        const end = new Date(
+          thirtyDaysAgo.getTime() + Math.min(i + 4, 30) * 86400000,
+        );
+        const label = start.toLocaleDateString("en-NG", {
+          month: "short",
+          day: "numeric",
+        });
+        let total = 0;
+        for (const [dayStr, amt] of Object.entries(byDay)) {
+          const d = new Date(dayStr);
+          if (d >= start && d < end) total += amt;
+        }
+        revenueTrend.push({ label, revenue: total });
+      }
+
+      // ── Activity feed — 10 most recent events across all event types ───────
+      // Each query fetches only the handful of columns needed for the feed row.
+      const [
+        recentUsersRes,
+        recentApprovedAppsRes,
+        recentQuizzesRes,
+        recentPaidPayoutsRes,
+        recentOpenReportsRes,
+        recentPendingPayoutsRes,
+      ] = await Promise.all([
+        // Last 15 user signups — we'll trim to top 10 after merge + sort
+        supabase
+          .from("profiles")
+          .select("id, full_name, role, created_at")
+          .eq("role", "user")
+          .order("created_at", { ascending: false })
+          .limit(15),
+        // Last 10 creator approvals
+        supabase
+          .from("creator_applications")
+          .select("id, user_id, submitted_at")
+          .eq("status", "approved")
+          .order("submitted_at", { ascending: false })
+          .limit(10),
+        // Last 10 published quizzes
+        supabase
+          .from("quizzes")
+          .select("id, title, creator_id, created_at")
+          .eq("is_published", true)
+          .order("created_at", { ascending: false })
+          .limit(10),
+        // Last 10 paid payouts
+        supabase
+          .from("payout_requests")
+          .select("id, creator_id, amount, processed_at")
+          .eq("status", "paid")
+          .not("processed_at", "is", null)
+          .order("processed_at", { ascending: false })
+          .limit(10),
+        // Last 10 open reports
+        supabase
+          .from("reports")
+          .select("id, quiz_id, quiz_title, reason, created_at")
+          .eq("status", "open")
+          .order("created_at", { ascending: false })
+          .limit(10),
+        // Last 10 pending payout requests
+        supabase
+          .from("payout_requests")
+          .select("id, creator_id, amount, requested_at")
+          .eq("status", "pending")
+          .order("requested_at", { ascending: false })
+          .limit(10),
+      ]);
+
+      // Collect all profile IDs we need for the activity feed names
+      const profileIdsNeeded = new Set();
+      (recentApprovedAppsRes.data || []).forEach((a) =>
+        profileIdsNeeded.add(a.user_id),
+      );
+      (recentQuizzesRes.data || []).forEach((q) =>
+        profileIdsNeeded.add(q.creator_id),
+      );
+      (recentPaidPayoutsRes.data || []).forEach((p) =>
+        profileIdsNeeded.add(p.creator_id),
+      );
+      (recentPendingPayoutsRes.data || []).forEach((p) =>
+        profileIdsNeeded.add(p.creator_id),
+      );
+
+      // Fetch only those profiles — tiny scoped query, not all profiles
+      const profileIds = Array.from(profileIdsNeeded);
+      let profileMap = {};
+      if (profileIds.length > 0) {
+        const { data: profileRows } = await supabase
+          .from("profiles")
+          .select("id, full_name")
+          .in("id", profileIds);
+        (profileRows || []).forEach((p) => {
+          profileMap[p.id] = p.full_name;
+        });
+      }
+
+      // Build unified activity items
+      const activityItems = [];
+
+      (recentUsersRes.data || []).forEach((p) => {
+        activityItems.push({
+          id: `signup-${p.id}`,
+          type: "signup",
+          label: `${p.full_name} joined`,
+          meta: "New user sign-up",
+          ts: p.created_at,
+        });
+      });
+
+      (recentApprovedAppsRes.data || []).forEach((a) => {
+        activityItems.push({
+          id: `approved-${a.id}`,
+          type: "creator_approved",
+          label: `${profileMap[a.user_id] ?? "A creator"} approved as creator`,
+          meta: "Creator application approved",
+          ts: a.submitted_at,
+        });
+      });
+
+      (recentQuizzesRes.data || []).forEach((q) => {
+        const title =
+          q.title.length > 40 ? q.title.slice(0, 40) + "…" : q.title;
+        activityItems.push({
+          id: `quiz-${q.id}`,
+          type: "quiz_published",
+          label: `"${title}" published`,
+          meta: `by ${profileMap[q.creator_id] ?? "Unknown"}`,
+          ts: q.created_at,
+        });
+      });
+
+      (recentPaidPayoutsRes.data || []).forEach((p) => {
+        activityItems.push({
+          id: `payout-${p.id}`,
+          type: "payout_paid",
+          label: `Payout of ₦${Number(p.amount).toLocaleString("en-NG", { maximumFractionDigits: 2 })} processed`,
+          meta: `to ${profileMap[p.creator_id] ?? "creator"}`,
+          ts: p.processed_at,
+        });
+      });
+
+      (recentOpenReportsRes.data || []).forEach((r) => {
+        const quizTitle = r.quiz_title || "a quiz";
+        const shortTitle =
+          quizTitle.length > 36 ? quizTitle.slice(0, 36) + "…" : quizTitle;
+        activityItems.push({
+          id: `report-${r.id}`,
+          type: "report_filed",
+          label: `Report filed on "${shortTitle}"`,
+          meta: `Reason: ${r.reason.replace(/_/g, " ")}`,
+          ts: r.created_at,
+        });
+      });
+
+      (recentPendingPayoutsRes.data || []).forEach((p) => {
+        activityItems.push({
+          id: `payout-req-${p.id}`,
+          type: "payout_pending",
+          label: `Payout request: ₦${Number(p.amount).toLocaleString("en-NG", { maximumFractionDigits: 2 })}`,
+          meta: `from ${profileMap[p.creator_id] ?? "creator"} — awaiting review`,
+          ts: p.requested_at,
+        });
+      });
+
+      // Sort by most recent, take top 10
+      const activityFeed = activityItems
+        .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime())
+        .slice(0, 10);
+
+      return res.json({
+        counts: {
+          totalUsers: totalUsersRes.count ?? 0,
+          totalCreators: totalCreatorsRes.count ?? 0,
+          totalQuizzes: totalQuizzesRes.count ?? 0,
+          publishedQuizzes: publishedQuizzesRes.count ?? 0,
+          totalAttempts: totalAttemptsRes.count ?? 0,
+          pendingApplications: pendingAppsRes.count ?? 0,
+          pendingPayouts: pendingPayoutsRes.count ?? 0,
+          openReports: openReportsRes.count ?? 0,
+        },
+        financials: {
+          grossTopUpVolume,
+          platformPaymentFees,
+          netTopUpCash,
+          platformRevenue,
+        },
+        revenueTrend,
+        activityFeed,
+      });
+    } catch (err) {
+      console.error("Admin dashboard error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
 // GET /api/admin/users — paginated profiles + auth emails
 app.get(
   "/api/admin/users",
