@@ -3730,6 +3730,107 @@ app.delete(
   },
 );
 
+// GET /api/admin/quizzes — paginated quiz list with filtering + sorting
+// Mirrors the /api/admin/users pattern. Filters: universityId, status,
+// department (subject_area), search (title). Sort: newest | attempts |
+// revenue | price-desc | price-asc.
+app.get(
+  "/api/admin/quizzes",
+  authenticateRequest,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+      const pageSize = Math.min(
+        100,
+        Math.max(1, Number.parseInt(req.query.pageSize, 10) || 25),
+      );
+      const universityId = String(req.query.universityId || "").trim();
+      const status = String(req.query.status || "all");
+      const search = String(req.query.search || "").trim();
+      const sort = String(req.query.sort || "newest");
+      const department = String(req.query.department || "all");
+
+      let query = supabase.from("quizzes").select("*", { count: "exact" });
+
+      // University filter
+      if (universityId && universityId !== "all") {
+        query = query.eq("university_id", universityId);
+      }
+
+      // Status filter
+      if (status === "published") {
+        query = query
+          .eq("is_published", true)
+          .eq("unpublished_by_admin", false);
+      } else if (status === "unpublished") {
+        query = query.or("is_published.eq.false,unpublished_by_admin.eq.true");
+      }
+
+      // Department filter — resolve department to course IDs first
+      if (department && department !== "all") {
+        const { data: deptCourses } = await supabase
+          .from("courses")
+          .select("id")
+          .eq("subject_area", department);
+        const courseIds = (deptCourses || []).map((c) => c.id);
+        if (courseIds.length === 0) {
+          // No matching courses — return empty result immediately
+          return res.json({ quizzes: [], total: 0, page, pageSize });
+        }
+        query = query.in("course_id", courseIds);
+      }
+
+      // Search — title match
+      if (search) {
+        query = query.ilike("title", `%${search.replace(/[%,]/g, "")}%`);
+      }
+
+      // Sort
+      switch (sort) {
+        case "attempts":
+          query = query.order("attempt_count", { ascending: false });
+          break;
+        case "price-desc":
+          query = query.order("price", { ascending: false });
+          break;
+        case "price-asc":
+          query = query.order("price", { ascending: true });
+          break;
+        case "revenue":
+          // Revenue sort is computed client-side from the txns map;
+          // fall back to newest for the DB query ordering.
+          query = query.order("created_at", { ascending: false });
+          break;
+        default:
+          query = query.order("created_at", { ascending: false });
+      }
+
+      const start = (page - 1) * pageSize;
+      const {
+        data: quizzes,
+        count,
+        error: quizErr,
+      } = await query.range(start, start + pageSize - 1);
+
+      if (quizErr) {
+        console.error("Admin get quizzes error:", quizErr);
+        return res.status(500).json({ error: "Failed to fetch quizzes" });
+      }
+
+      return res.json({
+        quizzes: quizzes || [],
+        total: count || 0,
+        page,
+        pageSize,
+      });
+    } catch (err) {
+      console.error("Admin get quizzes error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
 // POST /api/admin/quizzes/:id/unpublish — admin force-unpublish
 app.post(
   "/api/admin/quizzes/:id/unpublish",
