@@ -4308,10 +4308,12 @@ app.post("/api/reviews", authenticateRequest, async (req, res) => {
   }
 
   // ── Insert ─────────────────────────────────────────────────────────────────
+  // Reviews are auto-approved on submission — admins can hide or delete bad ones.
   const insertPayload = {
     reviewer_id: reviewerId,
     review_target_type: target_type,
     rating,
+    is_approved: true,
     ...(review_text ? { review_text: review_text.slice(0, 280) } : {}),
     ...(target_type === "quiz" && target_quiz_id ? { target_quiz_id } : {}),
     ...(target_type === "creator" && target_creator_id
