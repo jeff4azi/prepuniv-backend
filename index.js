@@ -4318,6 +4318,41 @@ app.put(
   },
 );
 
+// ─── User-facing university routes ────────────────────────────────────────────
+
+// POST /api/universities/:id/activate — list a catalog university
+// Any signed-in user may list a university that exists in the catalog but is
+// not yet listed (is_listed = false). Flips the flag so it becomes selectable
+// in onboarding for everyone from then on. Idempotent. Backs the
+// "Can't find your university?" flow on /select-university.
+app.post(
+  "/api/universities/:id/activate",
+  authenticateRequest,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      const { data, error } = await supabase
+        .from("universities")
+        .update({ is_listed: true })
+        .eq("id", id)
+        .select()
+        .single();
+      if (error) {
+        // PGRST116 => no row matched the id.
+        if (error.code === "PGRST116") {
+          return res.status(404).json({ error: "University not found" });
+        }
+        return res.status(500).json({ error: "Failed to activate university" });
+      }
+      return res.json({ university: data });
+    } catch (err) {
+      console.error("Activate university error:", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+  },
+);
+
 // POST /api/admin/universities — add university
 app.post(
   "/api/admin/universities",
@@ -4334,7 +4369,13 @@ app.post(
       const uniId = "uni_" + crypto.randomUUID();
       const { data, error } = await supabase
         .from("universities")
-        .insert({ id: uniId, name, abbreviation, state: state || null })
+        .insert({
+          id: uniId,
+          name,
+          abbreviation,
+          state: state || null,
+          is_listed: true,
+        })
         .select()
         .single();
       if (error)
